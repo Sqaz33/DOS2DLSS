@@ -1,3 +1,9 @@
 [submodule "third_party/nvidia_dlss"]
 	path = third_party/nvidia_dlss
 	url = https://github.com/NVIDIA/DLSS.git
+[submodule "third_party/ositools"]
+	path = third_party/ositools
+	url = https://github.com/Norbyte/ositools.git
+[submodule "third_party/dos2wasd"]
+	path = third_party/dos2wasd
+	url = https://github.com/Ch4nKyy/DOS2WASD.git
