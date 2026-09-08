@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
+#include <unordered_map>
 
 #include "reshade_api.hpp"
 #include "reshade_events.hpp"
@@ -31,6 +33,7 @@ UnregisterAddonFn g_unregister = nullptr;
 dos2dlss::SharedMapping g_mapping;
 wchar_t g_config_path[MAX_PATH] = {};
 wchar_t g_log_path[MAX_PATH] = {};
+wchar_t g_trace_path[MAX_PATH] = {};
 wchar_t g_ngx_path[MAX_PATH] = {};
 dos2dlss::NgxRuntime g_ngx;
 volatile LONG64 g_frame_draws = 0;
@@ -41,8 +44,96 @@ volatile LONG g_frame_scene_h = 0;
 volatile LONG g_frame_color_format = 0;
 volatile LONG g_frame_depth_format = 0;
 bool g_diagnostics = true;
-LONG64 g_trace_frame = 120;
-volatile LONG g_trace_bind_index = 0;
+
+struct CapturedTarget
+{
+    std::uint64_t resource = 0;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t format = 0;
+    char name[64] = {};
+};
+
+struct CapturedPass
+{
+    std::uint32_t target_count = 0;
+    CapturedTarget targets[8] = {};
+    CapturedTarget depth = {};
+    std::uint32_t draws = 0;
+    std::uint32_t indexed_draws = 0;
+    std::uint64_t first_vertex_shader = 0;
+    std::uint64_t last_vertex_shader = 0;
+    std::uint64_t first_pixel_shader = 0;
+    std::uint64_t last_pixel_shader = 0;
+};
+
+struct PipelineShaders
+{
+    std::uint64_t vertex = 0;
+    std::uint64_t pixel = 0;
+};
+
+CapturedPass g_captured_passes[256] = {};
+std::uint32_t g_captured_pass_count = 0;
+std::int32_t g_current_captured_pass = -1;
+bool g_capture_active = false;
+SRWLOCK g_pipeline_lock = SRWLOCK_INIT;
+std::unordered_map<std::uint64_t, PipelineShaders> g_pipeline_shaders;
+thread_local std::uint64_t g_bound_vertex_shader = 0;
+thread_local std::uint64_t g_bound_pixel_shader = 0;
+
+std::uint64_t hash_shader(const void *data, std::size_t size)
+{
+    // This is a stable trace identifier; shader replacement never relies on
+    // hash uniqueness alone.
+    const auto *bytes = static_cast<const std::uint8_t *>(data);
+    std::uint64_t hash = 14695981039346656037ull;
+    for (std::size_t i = 0; i < size; ++i)
+    {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    hash ^= static_cast<std::uint64_t>(size);
+    hash *= 1099511628211ull;
+    return hash;
+}
+
+void read_debug_name(std::uint64_t handle, char (&name)[64])
+{
+    if (handle == 0)
+        return;
+    auto *object = reinterpret_cast<ID3D11DeviceChild *>(handle);
+    UINT size = static_cast<UINT>(sizeof(name) - 1);
+    if (SUCCEEDED(object->GetPrivateData(WKPDID_D3DDebugObjectName, &size, name)))
+        name[(size < sizeof(name)) ? size : sizeof(name) - 1] = '\0';
+}
+
+CapturedTarget describe_target(reshade::api::device *device, reshade::api::resource resource)
+{
+    CapturedTarget target = {};
+    if (device == nullptr || resource.handle == 0)
+        return target;
+    const auto desc = device->get_resource_desc(resource);
+    target.resource = resource.handle;
+    target.width = desc.texture.width;
+    target.height = desc.texture.height;
+    target.format = static_cast<std::uint32_t>(desc.texture.format);
+    read_debug_name(resource.handle, target.name);
+    return target;
+}
+
+void record_bound_shaders()
+{
+    if (!g_capture_active || g_current_captured_pass < 0)
+        return;
+    auto &pass = g_captured_passes[g_current_captured_pass];
+    if (pass.first_vertex_shader == 0)
+        pass.first_vertex_shader = g_bound_vertex_shader;
+    if (pass.first_pixel_shader == 0)
+        pass.first_pixel_shader = g_bound_pixel_shader;
+    pass.last_vertex_shader = g_bound_vertex_shader;
+    pass.last_pixel_shader = g_bound_pixel_shader;
+}
 
 void log_line(const char *format, ...)
 {
@@ -156,6 +247,11 @@ bool on_draw(reshade::api::command_list *, std::uint32_t, std::uint32_t,
 {
     if (g_diagnostics)
         InterlockedIncrement64(&g_frame_draws);
+    if (g_capture_active && g_current_captured_pass >= 0)
+    {
+        ++g_captured_passes[g_current_captured_pass].draws;
+        record_bound_shaders();
+    }
     return false;
 }
 
@@ -164,6 +260,11 @@ bool on_draw_indexed(reshade::api::command_list *, std::uint32_t, std::uint32_t,
 {
     if (g_diagnostics)
         InterlockedIncrement64(&g_frame_indexed_draws);
+    if (g_capture_active && g_current_captured_pass >= 0)
+    {
+        ++g_captured_passes[g_current_captured_pass].indexed_draws;
+        record_bound_shaders();
+    }
     return false;
 }
 
@@ -174,49 +275,38 @@ void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
         return;
     InterlockedIncrement64(&g_frame_target_binds);
 
-    auto *shared = g_mapping.get();
-    if (shared != nullptr && shared->frame_number == g_trace_frame)
+    if (g_capture_active)
     {
-        const LONG bind_index = InterlockedIncrement(&g_trace_bind_index);
-        char line[1024] = {};
-        int offset = _snprintf_s(line, sizeof(line), _TRUNCATE, "TRACE bind=%ld rt_count=%u", bind_index, count);
-        auto *trace_device = cmd->get_device();
-        if (trace_device != nullptr && rtvs != nullptr)
+        if (g_captured_pass_count < static_cast<std::uint32_t>(std::size(g_captured_passes)))
         {
-            for (std::uint32_t i = 0; i < count && i < 8 && offset > 0 && offset < static_cast<int>(sizeof(line)); ++i)
+            g_current_captured_pass = static_cast<std::int32_t>(g_captured_pass_count++);
+            auto &pass = g_captured_passes[g_current_captured_pass];
+            pass = {};
+            pass.target_count = count;
+            auto *trace_device = cmd->get_device();
+            if (trace_device != nullptr && rtvs != nullptr)
             {
-                if (rtvs[i].handle == 0)
+                for (std::uint32_t i = 0; i < count && i < 8; ++i)
                 {
-                    offset += _snprintf_s(line + offset, sizeof(line) - offset, _TRUNCATE, " rt%u=null", i);
-                    continue;
+                    if (rtvs[i].handle == 0)
+                        continue;
+                    const auto resource = trace_device->get_resource_from_view(rtvs[i]);
+                    if (resource.handle == 0)
+                        continue;
+                    pass.targets[i] = describe_target(trace_device, resource);
                 }
-                const auto resource = trace_device->get_resource_from_view(rtvs[i]);
-                if (resource.handle == 0)
+            }
+            if (trace_device != nullptr && dsv.handle != 0)
+            {
+                const auto resource = trace_device->get_resource_from_view(dsv);
+                if (resource.handle != 0)
                 {
-                    offset += _snprintf_s(line + offset, sizeof(line) - offset, _TRUNCATE, " rt%u=null", i);
-                    continue;
+                    pass.depth = describe_target(trace_device, resource);
                 }
-                const auto desc = trace_device->get_resource_desc(resource);
-                offset += _snprintf_s(line + offset, sizeof(line) - offset, _TRUNCATE,
-                                      " rt%u=%llX:%ux%u:f%u", i,
-                                      static_cast<unsigned long long>(resource.handle),
-                                      desc.texture.width, desc.texture.height,
-                                      static_cast<unsigned>(desc.texture.format));
             }
         }
-        if (trace_device != nullptr && dsv.handle != 0 && offset > 0 && offset < static_cast<int>(sizeof(line)))
-        {
-            const auto resource = trace_device->get_resource_from_view(dsv);
-            if (resource.handle != 0)
-            {
-                const auto desc = trace_device->get_resource_desc(resource);
-                _snprintf_s(line + offset, sizeof(line) - offset, _TRUNCATE,
-                            " ds=%llX:%ux%u:f%u", static_cast<unsigned long long>(resource.handle),
-                            desc.texture.width, desc.texture.height,
-                            static_cast<unsigned>(desc.texture.format));
-            }
-        }
-        log_line("%s", line);
+        else
+            g_current_captured_pass = -1;
     }
     if (count == 0 || rtvs == nullptr || rtvs[0].handle == 0 || dsv.handle == 0)
         return;
@@ -247,6 +337,99 @@ void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
     }
 }
 
+void on_init_pipeline(reshade::api::device *, reshade::api::pipeline_layout,
+                      std::uint32_t count, const reshade::api::pipeline_subobject *subobjects,
+                      reshade::api::pipeline pipeline)
+{
+    if (pipeline.handle == 0 || subobjects == nullptr)
+        return;
+    PipelineShaders shaders = {};
+    for (std::uint32_t i = 0; i < count; ++i)
+    {
+        const auto &object = subobjects[i];
+        if (object.data == nullptr || object.count == 0)
+            continue;
+        if (object.type != reshade::api::pipeline_subobject_type::vertex_shader &&
+            object.type != reshade::api::pipeline_subobject_type::pixel_shader)
+            continue;
+        const auto *descs = static_cast<const reshade::api::shader_desc *>(object.data);
+        if (descs[0].code == nullptr || descs[0].code_size == 0)
+            continue;
+        const auto hash = hash_shader(descs[0].code, descs[0].code_size);
+        if (object.type == reshade::api::pipeline_subobject_type::vertex_shader)
+            shaders.vertex = hash;
+        else
+            shaders.pixel = hash;
+    }
+    if (shaders.vertex == 0 && shaders.pixel == 0)
+        return;
+    AcquireSRWLockExclusive(&g_pipeline_lock);
+    g_pipeline_shaders[pipeline.handle] = shaders;
+    ReleaseSRWLockExclusive(&g_pipeline_lock);
+}
+
+void on_destroy_pipeline(reshade::api::device *, reshade::api::pipeline pipeline)
+{
+    AcquireSRWLockExclusive(&g_pipeline_lock);
+    g_pipeline_shaders.erase(pipeline.handle);
+    ReleaseSRWLockExclusive(&g_pipeline_lock);
+}
+
+void on_bind_pipeline(reshade::api::command_list *, reshade::api::pipeline_stage stages,
+                      reshade::api::pipeline pipeline)
+{
+    PipelineShaders shaders = {};
+    AcquireSRWLockShared(&g_pipeline_lock);
+    const auto entry = g_pipeline_shaders.find(pipeline.handle);
+    if (entry != g_pipeline_shaders.end())
+        shaders = entry->second;
+    ReleaseSRWLockShared(&g_pipeline_lock);
+
+    const auto stage_bits = static_cast<std::uint32_t>(stages);
+    if ((stage_bits & static_cast<std::uint32_t>(reshade::api::pipeline_stage::vertex_shader)) != 0)
+        g_bound_vertex_shader = shaders.vertex;
+    if ((stage_bits & static_cast<std::uint32_t>(reshade::api::pipeline_stage::pixel_shader)) != 0)
+        g_bound_pixel_shader = shaders.pixel;
+}
+
+void write_captured_frame(LONG64 frame_number)
+{
+    FILE *file = nullptr;
+    if (_wfopen_s(&file, g_trace_path, L"w") != 0 || file == nullptr)
+        return;
+    fprintf(file, "DOS2DLSS render-pass capture for frame %lld\n", frame_number);
+    for (std::uint32_t index = 0; index < g_captured_pass_count; ++index)
+    {
+        const auto &pass = g_captured_passes[index];
+        fprintf(file, "pass=%u rt_count=%u draws=%u indexed=%u", index + 1,
+                pass.target_count, pass.draws, pass.indexed_draws);
+        for (std::uint32_t i = 0; i < pass.target_count && i < 8; ++i)
+        {
+            const auto &target = pass.targets[i];
+            if (target.resource == 0)
+                fprintf(file, " rt%u=null", i);
+            else
+                fprintf(file, " rt%u=%llX:%ux%u:f%u%s%s", i,
+                        static_cast<unsigned long long>(target.resource),
+                        target.width, target.height, target.format,
+                        target.name[0] != '\0' ? ":" : "", target.name);
+        }
+        if (pass.depth.resource != 0)
+            fprintf(file, " ds=%llX:%ux%u:f%u%s%s",
+                    static_cast<unsigned long long>(pass.depth.resource),
+                    pass.depth.width, pass.depth.height, pass.depth.format,
+                    pass.depth.name[0] != '\0' ? ":" : "", pass.depth.name);
+        if (pass.first_vertex_shader != 0 || pass.first_pixel_shader != 0)
+            fprintf(file, " vs=%016llX..%016llX ps=%016llX..%016llX",
+                    static_cast<unsigned long long>(pass.first_vertex_shader),
+                    static_cast<unsigned long long>(pass.last_vertex_shader),
+                    static_cast<unsigned long long>(pass.first_pixel_shader),
+                    static_cast<unsigned long long>(pass.last_pixel_shader));
+        fputc('\n', file);
+    }
+    fclose(file);
+}
+
 void on_present(reshade::api::command_queue *queue, reshade::api::swapchain *,
                 const reshade::api::rect *, const reshade::api::rect *,
                 std::uint32_t, const reshade::api::rect *)
@@ -254,6 +437,25 @@ void on_present(reshade::api::command_queue *queue, reshade::api::swapchain *,
     auto *state = g_mapping.get();
     if (state == nullptr)
         return;
+    if (g_capture_active)
+    {
+        write_captured_frame(state->frame_number);
+        g_capture_active = false;
+        g_current_captured_pass = -1;
+        InterlockedExchange(&state->captured_pass_count,
+                            static_cast<LONG>(g_captured_pass_count));
+        InterlockedExchange(&state->capture_complete, 1);
+        log_line("Captured %u render-target passes for frame %lld.",
+                 g_captured_pass_count, state->frame_number);
+    }
+    if (InterlockedExchange(&state->capture_requested, 0) != 0)
+    {
+        g_captured_pass_count = 0;
+        g_current_captured_pass = -1;
+        g_capture_active = true;
+        InterlockedExchange(&state->capture_complete, 0);
+        InterlockedExchange(&state->captured_pass_count, 0);
+    }
     if (queue != nullptr)
     {
         auto *context = reinterpret_cast<ID3D11DeviceContext *>(queue->get_native());
@@ -358,6 +560,16 @@ void draw_panel(reshade::api::effect_runtime *)
     if (g_ui->Checkbox("Reset DLSS history on the next frame", &reset) && reset)
         InterlockedExchange(&state->reset_requested, 1);
 
+    bool capture = false;
+    if (g_ui->Checkbox("Capture render passes on the next frame", &capture) && capture)
+    {
+        InterlockedExchange(&state->capture_complete, 0);
+        InterlockedExchange(&state->capture_requested, 1);
+    }
+    if (state->capture_complete)
+        panel_line("Captured %ld passes to dos2-dlss-frame-trace.log.",
+                   state->captured_pass_count);
+
     g_ui->SeparatorText("Runtime");
     panel_line("Native module: %s", InterlockedCompareExchange(&state->native_ready, 0, 0) ? "loaded" : "not loaded");
     panel_line("Game build: %s (%ls)", InterlockedCompareExchange(&state->exact_game_build, 0, 0) ? "verified" : "not verified", state->game_version);
@@ -400,6 +612,9 @@ bool register_callbacks()
     reg(reshade::addon_event::init_device, reinterpret_cast<void *>(&on_init_device));
     reg(reshade::addon_event::destroy_device, reinterpret_cast<void *>(&on_destroy_device));
     reg(reshade::addon_event::init_swapchain, reinterpret_cast<void *>(&on_init_swapchain));
+    reg(reshade::addon_event::init_pipeline, reinterpret_cast<void *>(&on_init_pipeline));
+    reg(reshade::addon_event::destroy_pipeline, reinterpret_cast<void *>(&on_destroy_pipeline));
+    reg(reshade::addon_event::bind_pipeline, reinterpret_cast<void *>(&on_bind_pipeline));
     reg(reshade::addon_event::draw, reinterpret_cast<void *>(&on_draw));
     reg(reshade::addon_event::draw_indexed, reinterpret_cast<void *>(&on_draw_indexed));
     reg(reshade::addon_event::bind_render_targets_and_depth_stencil, reinterpret_cast<void *>(&on_bind_targets));
@@ -428,6 +643,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         DisableThreadLibraryCalls(module);
         make_sibling_path(module, L"dos2-dlss.ini", g_config_path);
         make_sibling_path(module, L"dos2-dlss.log", g_log_path);
+        make_sibling_path(module, L"dos2-dlss-frame-trace.log", g_trace_path);
         make_sibling_path(module, L"DOS2DLSS-NGX", g_ngx_path);
         FILE *clear = nullptr;
         if (_wfopen_s(&clear, g_log_path, L"w") == 0 && clear != nullptr) fclose(clear);
@@ -437,7 +653,6 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         auto *state = g_mapping.get();
         InterlockedExchange(&state->quality_mode, load_mode());
         g_diagnostics = GetPrivateProfileIntW(L"DOS2DLSS", L"Diagnostics", 1, g_config_path) != 0;
-        g_trace_frame = GetPrivateProfileIntW(L"DOS2DLSS", L"TraceFrame", 120, g_config_path);
 
         if (!register_with_reshade() || !register_callbacks())
         {

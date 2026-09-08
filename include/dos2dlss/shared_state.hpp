@@ -5,9 +5,9 @@
 
 namespace dos2dlss
 {
-inline constexpr wchar_t kSharedMappingName[] = L"Local\\DOS2DLSS_State_v2";
+inline constexpr wchar_t kSharedMappingName[] = L"Local\\DOS2DLSS_State_v3";
 inline constexpr std::uint32_t kSharedMagic = 0x35534C44; // "DLS5"
-inline constexpr std::uint32_t kSharedVersion = 2;
+inline constexpr std::uint32_t kSharedVersion = 3;
 
 enum class QualityMode : LONG
 {
@@ -27,6 +27,9 @@ struct SharedState
     volatile LONG exact_game_build;
     volatile LONG quality_mode;
     volatile LONG reset_requested;
+    volatile LONG capture_requested;
+    volatile LONG capture_complete;
+    volatile LONG captured_pass_count;
     volatile LONG ngx_initialized;
     volatile LONG ngx_available;
     volatile LONG ngx_feature_created;

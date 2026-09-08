@@ -32,6 +32,7 @@ target_compile_options(dos2_dlss_addon PRIVATE /W4 /permissive- /EHsc)
 target_link_libraries(dos2_dlss_addon PRIVATE
   version
   d3d11
+  dxguid
   dxgi
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvidia_dlss/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib"
 )

@@ -3,21 +3,30 @@
 #include <windows.h>
 #include <cstdio>
 
-int wmain()
+int wmain(int argc, wchar_t **argv)
 {
-    HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, dos2dlss::kSharedMappingName);
+    const bool request_capture = argc == 2 && _wcsicmp(argv[1], L"--capture") == 0;
+    const DWORD access = request_capture ? FILE_MAP_ALL_ACCESS : FILE_MAP_READ;
+    HANDLE mapping = OpenFileMappingW(access, FALSE, dos2dlss::kSharedMappingName);
     if (mapping == nullptr)
     {
         fwprintf(stderr, L"DOS2DLSS is not running.\n");
         return 1;
     }
-    const auto *state = static_cast<const dos2dlss::SharedState *>(
-        MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, sizeof(dos2dlss::SharedState)));
+    auto *state = static_cast<dos2dlss::SharedState *>(
+        MapViewOfFile(mapping, access, 0, 0, sizeof(dos2dlss::SharedState)));
     if (state == nullptr)
     {
         CloseHandle(mapping);
         fwprintf(stderr, L"Cannot read DOS2DLSS shared state.\n");
         return 2;
+    }
+
+    if (request_capture)
+    {
+        InterlockedExchange(&state->capture_complete, 0);
+        InterlockedExchange(&state->capture_requested, 1);
+        wprintf(L"Render-pass capture requested.\n");
     }
 
     wprintf(L"native_ready=%ld\n", state->native_ready);
@@ -38,6 +47,9 @@ int wmain()
     wprintf(L"backbuffer=%ldx%ld\n", state->backbuffer_width, state->backbuffer_height);
     wprintf(L"scene_candidate=%ldx%ld\n", state->scene_width, state->scene_height);
     wprintf(L"dlss_render_size=%ldx%ld\n", state->render_width, state->render_height);
+    wprintf(L"capture_requested=%ld\n", state->capture_requested);
+    wprintf(L"capture_complete=%ld\n", state->capture_complete);
+    wprintf(L"captured_pass_count=%ld\n", state->captured_pass_count);
     wprintf(L"color_format=%ld\n", state->scene_color_format);
     wprintf(L"depth_format=%ld\n", state->scene_depth_format);
     wprintf(L"native_status=%ls\n", state->native_status);
