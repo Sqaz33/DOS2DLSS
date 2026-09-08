@@ -12,6 +12,10 @@ The intended rendering path is:
 
 DLSS5 Feeder is not part of this design.
 
+The installer pauses the DLSS5 Bridge and RenoDX DLSS5 entries for this game so
+RHI does not silently restore the expensive mirror on the next launch. The files
+and previous RHI selection are backed up and restored by `scripts/uninstall.ps1`.
+
 ## Status
 
 Milestone 0.6 runs native DLAA and Super Resolution in the game. The add-on identifies DOS2's final

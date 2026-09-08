@@ -43,6 +43,13 @@ foreach ($leaf in @('dlss5-feed.addon64', 'dlss5-bridge.addon64', 'd3dcompiler_4
         Move-Item -LiteralPath $disabled -Destination $active
     }
 }
+foreach ($leaf in @('DLSS5 DX11 Bridge.addon64', 'renodx-dlss5.addon64')) {
+    $active = Join-Path $bin $leaf
+    $disabled = "$active.dos2dlss-paused"
+    if ((-not (Test-Path -LiteralPath $active)) -and (Test-Path -LiteralPath $disabled)) {
+        Move-Item -LiteralPath $disabled -Destination $active
+    }
+}
 
 $bridgeBackup = Join-Path $backup 'dlss5-bridge.cfg'
 if (Test-Path -LiteralPath $bridgeBackup) {

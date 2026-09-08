@@ -69,6 +69,22 @@ foreach ($leaf in @('dlss5-feed.addon64', 'dlss5-bridge.addon64')) {
     }
 }
 
+# The native D3D11 integration does not need the D3D11->D3D12 mirror. Even
+# with Neural Rendering switched off, an enabled Bridge still mirrors and
+# evaluates every DLSS frame. Keep the experimental DLSS5 pair recoverable but
+# inactive while native DLSS is selected.
+foreach ($leaf in @('DLSS5 DX11 Bridge.addon64', 'renodx-dlss5.addon64')) {
+    $active = Join-Path $bin $leaf
+    $disabled = "$active.dos2dlss-paused"
+    if (Test-Path -LiteralPath $active) {
+        if (Test-Path -LiteralPath $disabled) { Remove-Item -LiteralPath $disabled -Force }
+        Move-Item -LiteralPath $active -Destination $disabled
+    }
+    if (Test-Path -LiteralPath $disabled) {
+        $renamed += [pscustomobject]@{ Active = $active; Disabled = $disabled }
+    }
+}
+
 # DOS2 ships the Windows 8.1 SDK build of D3DCompiler. RenoDX's DLSS5 proxy
 # compiles a Shader Model 5.1 compute shader at runtime, which that old DLL
 # rejects with X3506. Let Windows load its current system copy instead, while
@@ -114,7 +130,8 @@ if (Test-Path -LiteralPath $settingsPath) {
     $selection = $settings.PerGameAddonSelection | ConvertFrom-Json -AsHashtable
     $key = 'Divinity: Original Sin 2|Steam'
     if ($selection.ContainsKey($key)) {
-        $selection[$key] = @($selection[$key] | Where-Object { $_ -ne 'DLSS5 Feeder' })
+        $pausedAddons = @('DLSS5 Feeder', 'DLSS5 Tool', 'DLSS5 DX11 Bridge', 'RenoDX Upgrade')
+        $selection[$key] = @($selection[$key] | Where-Object { $_ -notin $pausedAddons })
         $settings.PerGameAddonSelection = $selection | ConvertTo-Json -Compress
         $settings | ConvertTo-Json -Compress -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8NoBOM
     }
@@ -124,7 +141,9 @@ $deploymentsPath = $rhiFiles[1]
 if (Test-Path -LiteralPath $deploymentsPath) {
     $deployments = Get-Content -LiteralPath $deploymentsPath -Raw | ConvertFrom-Json -AsHashtable
     if ($deployments.ContainsKey($bin)) {
-        $deployments[$bin] = @($deployments[$bin] | Where-Object { $_ -ne 'dlss5-feed.addon64' })
+        $pausedFiles = @('dlss5-feed.addon64', 'dlss5-bridge.addon64',
+                         'DLSS5 DX11 Bridge.addon64', 'renodx-dlss5.addon64')
+        $deployments[$bin] = @($deployments[$bin] | Where-Object { $_ -notin $pausedFiles })
         $deployments | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $deploymentsPath -Encoding utf8NoBOM
     }
 }
