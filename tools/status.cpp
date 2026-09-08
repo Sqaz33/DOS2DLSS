@@ -6,7 +6,8 @@
 int wmain(int argc, wchar_t **argv)
 {
     const bool request_capture = argc == 2 && _wcsicmp(argv[1], L"--capture") == 0;
-    const DWORD access = request_capture ? FILE_MAP_ALL_ACCESS : FILE_MAP_READ;
+    const bool request_screenshot = argc == 2 && _wcsicmp(argv[1], L"--screenshot") == 0;
+    const DWORD access = (request_capture || request_screenshot) ? FILE_MAP_ALL_ACCESS : FILE_MAP_READ;
     HANDLE mapping = OpenFileMappingW(access, FALSE, dos2dlss::kSharedMappingName);
     if (mapping == nullptr)
     {
@@ -28,6 +29,12 @@ int wmain(int argc, wchar_t **argv)
         InterlockedExchange(&state->capture_requested, 1);
         wprintf(L"Render-pass capture requested.\n");
     }
+    if (request_screenshot)
+    {
+        InterlockedExchange(&state->screenshot_complete, 0);
+        InterlockedExchange(&state->screenshot_requested, 1);
+        wprintf(L"ReShade screenshot requested.\n");
+    }
 
     wprintf(L"native_ready=%ld\n", state->native_ready);
     wprintf(L"addon_ready=%ld\n", state->addon_ready);
@@ -40,6 +47,10 @@ int wmain(int argc, wchar_t **argv)
     wprintf(L"ngx_init_result=0x%08lX\n", state->ngx_init_result);
     wprintf(L"ngx_capability_result=0x%08lX\n", state->ngx_capability_result);
     wprintf(L"ngx_feature_result=0x%08lX\n", state->ngx_feature_result);
+    wprintf(L"ngx_evaluate_result=0x%08lX\n", state->ngx_evaluate_result);
+    wprintf(L"camera_motion_ready=%ld\n", state->camera_motion_ready);
+    wprintf(L"native_dlss_active=%ld\n", state->native_dlss_active);
+    wprintf(L"ngx_evaluated_frames=%lld\n", state->ngx_evaluated_frames);
     wprintf(L"frame=%lld\n", state->frame_number);
     wprintf(L"draws=%lld\n", state->draw_calls);
     wprintf(L"indexed_draws=%lld\n", state->indexed_draw_calls);
@@ -50,6 +61,9 @@ int wmain(int argc, wchar_t **argv)
     wprintf(L"capture_requested=%ld\n", state->capture_requested);
     wprintf(L"capture_complete=%ld\n", state->capture_complete);
     wprintf(L"captured_pass_count=%ld\n", state->captured_pass_count);
+    wprintf(L"screenshot_requested=%ld\n", state->screenshot_requested);
+    wprintf(L"screenshot_complete=%ld\n", state->screenshot_complete);
+    wprintf(L"screenshot_path=%ls\n", state->screenshot_path);
     wprintf(L"color_format=%ld\n", state->scene_color_format);
     wprintf(L"depth_format=%ld\n", state->scene_depth_format);
     wprintf(L"native_status=%ls\n", state->native_status);

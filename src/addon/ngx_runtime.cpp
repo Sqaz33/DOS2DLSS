@@ -180,7 +180,6 @@ void NgxRuntime::sync_feature(ID3D11DeviceContext *context, int mode,
     create.Feature.InTargetHeight = output_height;
     create.Feature.InPerfQualityValue = perf_quality;
     create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
-                                  NVSDK_NGX_DLSS_Feature_Flags_DepthInverted |
                                   NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     create.InEnableOutputSubrects = false;
 
@@ -202,6 +201,43 @@ void NgxRuntime::sync_feature(ID3D11DeviceContext *context, int mode,
     InterlockedExchange(&state->render_height, static_cast<LONG>(render_height));
     write_log(log, "NGX DLSS feature created: result=0x%08lX, input=%lux%lu, output=%lux%lu.",
               create_result, render_width, render_height, output_width, output_height);
+}
+
+bool NgxRuntime::evaluate(ID3D11DeviceContext *context, ID3D11Resource *color,
+                          ID3D11Resource *output, ID3D11Resource *depth,
+                          ID3D11Resource *motion_vectors, std::uint32_t render_width,
+                          std::uint32_t render_height, bool reset,
+                          SharedState *state, LogFn log)
+{
+    if (context == nullptr || feature_ == nullptr || parameters_ == nullptr ||
+        color == nullptr || output == nullptr || depth == nullptr ||
+        motion_vectors == nullptr || state == nullptr)
+        return false;
+
+    NVSDK_NGX_D3D11_DLSS_Eval_Params eval = {};
+    eval.Feature.pInColor = color;
+    eval.Feature.pInOutput = output;
+    eval.Feature.InSharpness = 0.0f;
+    eval.pInDepth = depth;
+    eval.pInMotionVectors = motion_vectors;
+    eval.InJitterOffsetX = 0.0f;
+    eval.InJitterOffsetY = 0.0f;
+    eval.InRenderSubrectDimensions.Width = render_width;
+    eval.InRenderSubrectDimensions.Height = render_height;
+    eval.InReset = reset ? 1 : 0;
+    eval.InMVScaleX = 1.0f;
+    eval.InMVScaleY = 1.0f;
+
+    const NVSDK_NGX_Result result =
+        NGX_D3D11_EVALUATE_DLSS_EXT(context, feature_, parameters_, &eval);
+    InterlockedExchange(&state->ngx_evaluate_result, static_cast<LONG>(result));
+    if (NVSDK_NGX_FAILED(result))
+    {
+        write_log(log, "NGX DLSS evaluate failed: 0x%08lX.", result);
+        return false;
+    }
+    InterlockedIncrement64(&state->ngx_evaluated_frames);
+    return true;
 }
 
 void NgxRuntime::shutdown(SharedState *state, LogFn log)

@@ -114,6 +114,5 @@ if (Test-Path -LiteralPath $deploymentsPath) {
     RhiFiles = @($rhiFiles | Where-Object { Test-Path -LiteralPath $_ })
 } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $statePath -Encoding utf8NoBOM
 
-Write-Host 'DOS2DLSS probe installed.'
-Write-Host 'Launch the game through RHI or Steam and open ReShade with Home.'
-
+Write-Host 'DOS2DLSS installed.'
+Write-Host 'Launch the game through RHI or Steam and open ReShade with F11.'

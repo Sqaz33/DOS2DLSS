@@ -5,9 +5,9 @@
 
 namespace dos2dlss
 {
-inline constexpr wchar_t kSharedMappingName[] = L"Local\\DOS2DLSS_State_v3";
+inline constexpr wchar_t kSharedMappingName[] = L"Local\\DOS2DLSS_State_v5";
 inline constexpr std::uint32_t kSharedMagic = 0x35534C44; // "DLS5"
-inline constexpr std::uint32_t kSharedVersion = 3;
+inline constexpr std::uint32_t kSharedVersion = 5;
 
 enum class QualityMode : LONG
 {
@@ -30,16 +30,22 @@ struct SharedState
     volatile LONG capture_requested;
     volatile LONG capture_complete;
     volatile LONG captured_pass_count;
+    volatile LONG screenshot_requested;
+    volatile LONG screenshot_complete;
     volatile LONG ngx_initialized;
     volatile LONG ngx_available;
     volatile LONG ngx_feature_created;
     volatile LONG ngx_init_result;
     volatile LONG ngx_capability_result;
     volatile LONG ngx_feature_result;
+    volatile LONG ngx_evaluate_result;
+    volatile LONG camera_motion_ready;
+    volatile LONG native_dlss_active;
     volatile LONG64 frame_number;
     volatile LONG64 draw_calls;
     volatile LONG64 indexed_draw_calls;
     volatile LONG64 target_bind_calls;
+    volatile LONG64 ngx_evaluated_frames;
     volatile LONG backbuffer_width;
     volatile LONG backbuffer_height;
     volatile LONG scene_width;
@@ -52,6 +58,7 @@ struct SharedState
     wchar_t game_sha256[65];
     wchar_t native_status[192];
     wchar_t addon_status[192];
+    wchar_t screenshot_path[MAX_PATH];
 };
 
 class SharedMapping

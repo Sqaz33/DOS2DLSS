@@ -1,4 +1,5 @@
 #include "dos2dlss/shared_state.hpp"
+#include "frame_pipeline.hpp"
 #include "ngx_runtime.hpp"
 
 #include <windows.h>
@@ -19,7 +20,7 @@
 #include "reshade_api.hpp"
 #include "reshade_events.hpp"
 
-extern "C" __declspec(dllexport) const char *NAME = "DOS2 DLSS 0.2.0";
+extern "C" __declspec(dllexport) const char *NAME = "DOS2 DLSS 0.3.0";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Controls and diagnostics for the native Divinity: Original Sin 2 DLSS integration.";
 
@@ -41,6 +42,7 @@ wchar_t g_trace_path[MAX_PATH] = {};
 wchar_t g_shader_dir[MAX_PATH] = {};
 wchar_t g_ngx_path[MAX_PATH] = {};
 dos2dlss::NgxRuntime g_ngx;
+dos2dlss::FramePipeline g_frame_pipeline;
 volatile LONG64 g_frame_draws = 0;
 volatile LONG64 g_frame_indexed_draws = 0;
 volatile LONG64 g_frame_target_binds = 0;
@@ -49,6 +51,7 @@ volatile LONG g_frame_scene_h = 0;
 volatile LONG g_frame_color_format = 0;
 volatile LONG g_frame_depth_format = 0;
 bool g_diagnostics = true;
+constexpr std::uint64_t kCombineUiPixelShader = 0x7D52DF001176EB8Dull;
 
 struct CapturedTarget
 {
@@ -316,17 +319,23 @@ void on_init_device(reshade::api::device *device)
     if (device->get_api() == reshade::api::device_api::d3d11)
     {
         auto *native_device = reinterpret_cast<ID3D11Device *>(device->get_native());
+        g_frame_pipeline.initialize(native_device, &log_message);
         if (g_ngx.initialize(native_device, g_ngx_path, g_mapping.get(), &log_message))
             update_status(L"D3D11 active; NVIDIA NGX initialized.");
         else
             update_status(L"D3D11 active; NVIDIA NGX initialization failed. See dos2-dlss.log.");
     }
     else
-        update_status(L"Unsupported graphics API: DOS2DLSS requires D3D11.");
+    {
+        auto *state = g_mapping.get();
+        if (state == nullptr || InterlockedCompareExchange(&state->ngx_initialized, 0, 0) == 0)
+            update_status(L"Unsupported graphics API: DOS2DLSS requires D3D11.");
+    }
 }
 
 void on_destroy_device(reshade::api::device *)
 {
+    g_frame_pipeline.shutdown();
     g_ngx.shutdown(g_mapping.get(), &log_message);
 }
 
@@ -345,9 +354,60 @@ void on_init_swapchain(reshade::api::swapchain *swapchain, bool)
     }
 }
 
+void evaluate_native_dlaa(reshade::api::command_list *cmd)
+{
+    auto *state = g_mapping.get();
+    if (cmd == nullptr || state == nullptr || g_bound_pixel_shader != kCombineUiPixelShader ||
+        InterlockedCompareExchange(&state->quality_mode, 0, 0) !=
+            static_cast<LONG>(dos2dlss::QualityMode::dlaa) ||
+        InterlockedCompareExchange(&state->ngx_feature_created, 0, 0) == 0)
+        return;
+
+    float current_view_projection[16] = {};
+    const auto per_view = g_bound_pixel_constant_buffers[12];
+    if (per_view.buffer.handle == 0 || per_view.offset != 0)
+        return;
+    AcquireSRWLockShared(&g_pipeline_lock);
+    const auto snapshot = g_buffer_snapshots.find(per_view.buffer.handle);
+    const bool have_camera = snapshot != g_buffer_snapshots.end() && snapshot->second.size >= 192;
+    if (have_camera)
+        std::memcpy(current_view_projection, snapshot->second.bytes.data() + 128,
+                    sizeof(current_view_projection));
+    ReleaseSRWLockShared(&g_pipeline_lock);
+    if (!have_camera)
+        return;
+
+    auto *context = reinterpret_cast<ID3D11DeviceContext *>(cmd->get_native());
+    if (context == nullptr)
+        return;
+    ID3D11ShaderResourceView *input_view = nullptr;
+    context->PSGetShaderResources(0, 1, &input_view);
+    if (input_view == nullptr)
+        return;
+    ID3D11Resource *input_color = nullptr;
+    input_view->GetResource(&input_color);
+    input_view->Release();
+    if (input_color == nullptr)
+        return;
+
+    const auto width = static_cast<std::uint32_t>(state->backbuffer_width);
+    const auto height = static_cast<std::uint32_t>(state->backbuffer_height);
+    const bool reset = InterlockedExchange(&state->reset_requested, 0) != 0;
+    ID3D11ShaderResourceView *output_view = g_frame_pipeline.evaluate(
+        context, input_color, current_view_projection, width, height,
+        reset, g_ngx, state, &log_message);
+    input_color->Release();
+    if (output_view != nullptr)
+    {
+        context->PSSetShaderResources(0, 1, &output_view);
+        InterlockedExchange(&state->native_dlss_active, 1);
+    }
+}
+
 bool on_draw(reshade::api::command_list *cmd, std::uint32_t, std::uint32_t,
              std::uint32_t, std::uint32_t)
 {
+    evaluate_native_dlaa(cmd);
     if (g_diagnostics)
         InterlockedIncrement64(&g_frame_draws);
     if (g_capture_active && g_current_captured_pass >= 0)
@@ -361,6 +421,7 @@ bool on_draw(reshade::api::command_list *cmd, std::uint32_t, std::uint32_t,
 bool on_draw_indexed(reshade::api::command_list *cmd, std::uint32_t, std::uint32_t,
                      std::uint32_t, std::int32_t, std::uint32_t)
 {
+    evaluate_native_dlaa(cmd);
     if (g_diagnostics)
         InterlockedIncrement64(&g_frame_indexed_draws);
     if (g_capture_active && g_current_captured_pass >= 0)
@@ -424,6 +485,20 @@ void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
 
     const auto color = device->get_resource_desc(color_resource);
     const auto depth = device->get_resource_desc(depth_resource);
+
+    if (count == 4 && color.texture.width == static_cast<std::uint32_t>(
+            InterlockedCompareExchange(&g_mapping.get()->backbuffer_width, 0, 0)) &&
+        color.texture.format == reshade::api::format::r11g11b10_float)
+    {
+        const auto second = device->get_resource_desc(device->get_resource_from_view(rtvs[1]));
+        const auto third = device->get_resource_desc(device->get_resource_from_view(rtvs[2]));
+        const auto fourth = device->get_resource_desc(device->get_resource_from_view(rtvs[3]));
+        if (second.texture.format == reshade::api::format::r16g16_float &&
+            third.texture.format == reshade::api::format::r8g8b8a8_unorm &&
+            fourth.texture.format == reshade::api::format::r8g8b8a8_unorm)
+            g_frame_pipeline.set_scene_depth(
+                reinterpret_cast<ID3D11Resource *>(depth_resource.handle));
+    }
     if (color.texture.width != depth.texture.width || color.texture.height != depth.texture.height)
         return;
 
@@ -663,6 +738,12 @@ void on_present(reshade::api::command_queue *queue, reshade::api::swapchain *,
     {
         auto *context = reinterpret_cast<ID3D11DeviceContext *>(queue->get_native());
         const int mode = static_cast<int>(InterlockedCompareExchange(&state->quality_mode, 0, 0));
+        if (mode != static_cast<int>(dos2dlss::QualityMode::dlaa))
+        {
+            g_frame_pipeline.reset_history();
+            InterlockedExchange(&state->native_dlss_active, 0);
+            InterlockedExchange(&state->camera_motion_ready, 0);
+        }
         g_ngx.sync_feature(context, mode,
                            static_cast<std::uint32_t>(state->backbuffer_width),
                            static_cast<std::uint32_t>(state->backbuffer_height),
@@ -676,6 +757,29 @@ void on_present(reshade::api::command_queue *queue, reshade::api::swapchain *,
     InterlockedExchange(&state->scene_height, InterlockedExchange(&g_frame_scene_h, 0));
     InterlockedExchange(&state->scene_color_format, InterlockedExchange(&g_frame_color_format, 0));
     InterlockedExchange(&state->scene_depth_format, InterlockedExchange(&g_frame_depth_format, 0));
+}
+
+void on_reshade_present(reshade::api::effect_runtime *runtime)
+{
+    auto *state = g_mapping.get();
+    if (runtime != nullptr && state != nullptr &&
+        InterlockedExchange(&state->screenshot_requested, 0) != 0)
+    {
+        InterlockedExchange(&state->screenshot_complete, 0);
+        state->screenshot_path[0] = L'\0';
+        runtime->save_screenshot("DOS2DLSS");
+    }
+}
+
+void on_reshade_screenshot(reshade::api::effect_runtime *, const char *path)
+{
+    auto *state = g_mapping.get();
+    if (state == nullptr)
+        return;
+    if (path != nullptr)
+        MultiByteToWideChar(CP_UTF8, 0, path, -1, state->screenshot_path,
+                            static_cast<int>(std::size(state->screenshot_path)));
+    InterlockedExchange(&state->screenshot_complete, 1);
 }
 
 enum : std::size_t
@@ -773,6 +877,15 @@ void draw_panel(reshade::api::effect_runtime *)
         panel_line("Captured %ld passes to dos2-dlss-frame-trace.log.",
                    state->captured_pass_count);
 
+    bool screenshot = false;
+    if (g_ui->Checkbox("Save a ReShade screenshot on the next frame", &screenshot) && screenshot)
+    {
+        InterlockedExchange(&state->screenshot_complete, 0);
+        InterlockedExchange(&state->screenshot_requested, 1);
+    }
+    if (state->screenshot_complete)
+        panel_line("Screenshot: %ls", state->screenshot_path);
+
     g_ui->SeparatorText("Runtime");
     panel_line("Native module: %s", InterlockedCompareExchange(&state->native_ready, 0, 0) ? "loaded" : "not loaded");
     panel_line("Game build: %s (%ls)", InterlockedCompareExchange(&state->exact_game_build, 0, 0) ? "verified" : "not verified", state->game_version);
@@ -782,6 +895,10 @@ void draw_panel(reshade::api::effect_runtime *)
                InterlockedCompareExchange(&state->ngx_feature_created, 0, 0) ? "created" : "not created");
     panel_line("NGX results: init 0x%08lX, capability 0x%08lX, feature 0x%08lX",
                state->ngx_init_result, state->ngx_capability_result, state->ngx_feature_result);
+    panel_line("Native evaluation: %s; camera motion: %s; result 0x%08lX; frames %lld",
+               state->native_dlss_active ? "active (DLAA)" : "waiting",
+               state->camera_motion_ready ? "ready" : "waiting",
+               state->ngx_evaluate_result, state->ngx_evaluated_frames);
     panel_line("Back buffer: %ld x %ld", state->backbuffer_width, state->backbuffer_height);
     panel_line("DLSS contract: %ld x %ld -> %ld x %ld",
                state->render_width, state->render_height,
@@ -826,6 +943,8 @@ bool register_callbacks()
     reg(reshade::addon_event::draw_indexed, reinterpret_cast<void *>(&on_draw_indexed));
     reg(reshade::addon_event::bind_render_targets_and_depth_stencil, reinterpret_cast<void *>(&on_bind_targets));
     reg(reshade::addon_event::present, reinterpret_cast<void *>(&on_present));
+    reg(reshade::addon_event::reshade_present, reinterpret_cast<void *>(&on_reshade_present));
+    reg(reshade::addon_event::reshade_screenshot, reinterpret_cast<void *>(&on_reshade_screenshot));
 
     // The member ordinals above describe the 19000 compatibility table.
     // Requesting the newer 19250 table with this layout reached the wrong
@@ -869,7 +988,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         }
         InterlockedExchange(&state->addon_ready, 1);
         update_status(L"ReShade probe panel registered.");
-        log_line("DOS2 DLSS 0.2.0 registered with ReShade.");
+        log_line("DOS2 DLSS 0.3.0 registered with ReShade.");
     }
     else if (reason == DLL_PROCESS_DETACH && reserved == nullptr)
     {

@@ -4,6 +4,7 @@
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
+struct ID3D11Resource;
 struct NVSDK_NGX_Handle;
 struct NVSDK_NGX_Parameter;
 
@@ -21,6 +22,11 @@ public:
     void sync_feature(ID3D11DeviceContext *context, int mode,
                       std::uint32_t output_width, std::uint32_t output_height,
                       SharedState *state, LogFn log);
+    bool evaluate(ID3D11DeviceContext *context, ID3D11Resource *color,
+                  ID3D11Resource *output, ID3D11Resource *depth,
+                  ID3D11Resource *motion_vectors, std::uint32_t render_width,
+                  std::uint32_t render_height, bool reset,
+                  SharedState *state, LogFn log);
     void shutdown(SharedState *state, LogFn log);
 
 private:
