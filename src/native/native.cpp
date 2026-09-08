@@ -91,7 +91,10 @@ bool sha256_file(const wchar_t *path, std::wstring &hex)
         goto done;
 
     {
-        std::array<unsigned char, 1024 * 1024> buffer = {};
+        // NativeModLoader creates this worker with the process default stack.
+        // A 1 MiB local array exhausts that stack before the game reaches its
+        // first window, so keep the streaming buffer on the heap.
+        std::vector<unsigned char> buffer(1024 * 1024);
         DWORD read = 0;
         while (ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr) && read != 0)
             if (BCryptHashData(hash, buffer.data(), read, 0) < 0)
