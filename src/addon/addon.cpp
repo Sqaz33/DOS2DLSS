@@ -37,6 +37,8 @@ volatile LONG g_frame_scene_h = 0;
 volatile LONG g_frame_color_format = 0;
 volatile LONG g_frame_depth_format = 0;
 bool g_diagnostics = true;
+LONG64 g_trace_frame = 120;
+volatile LONG g_trace_bind_index = 0;
 
 void log_line(const char *format, ...)
 {
@@ -151,6 +153,51 @@ void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
     if (!g_diagnostics || cmd == nullptr)
         return;
     InterlockedIncrement64(&g_frame_target_binds);
+
+    auto *shared = g_mapping.get();
+    if (shared != nullptr && shared->frame_number == g_trace_frame)
+    {
+        const LONG bind_index = InterlockedIncrement(&g_trace_bind_index);
+        char line[1024] = {};
+        int offset = _snprintf_s(line, sizeof(line), _TRUNCATE, "TRACE bind=%ld rt_count=%u", bind_index, count);
+        auto *trace_device = cmd->get_device();
+        if (trace_device != nullptr && rtvs != nullptr)
+        {
+            for (std::uint32_t i = 0; i < count && i < 8 && offset > 0 && offset < static_cast<int>(sizeof(line)); ++i)
+            {
+                if (rtvs[i].handle == 0)
+                {
+                    offset += _snprintf_s(line + offset, sizeof(line) - offset, _TRUNCATE, " rt%u=null", i);
+                    continue;
+                }
+                const auto resource = trace_device->get_resource_from_view(rtvs[i]);
+                if (resource.handle == 0)
+                {
+                    offset += _snprintf_s(line + offset, sizeof(line) - offset, _TRUNCATE, " rt%u=null", i);
+                    continue;
+                }
+                const auto desc = trace_device->get_resource_desc(resource);
+                offset += _snprintf_s(line + offset, sizeof(line) - offset, _TRUNCATE,
+                                      " rt%u=%llX:%ux%u:f%u", i,
+                                      static_cast<unsigned long long>(resource.handle),
+                                      desc.texture.width, desc.texture.height,
+                                      static_cast<unsigned>(desc.texture.format));
+            }
+        }
+        if (trace_device != nullptr && dsv.handle != 0 && offset > 0 && offset < static_cast<int>(sizeof(line)))
+        {
+            const auto resource = trace_device->get_resource_from_view(dsv);
+            if (resource.handle != 0)
+            {
+                const auto desc = trace_device->get_resource_desc(resource);
+                _snprintf_s(line + offset, sizeof(line) - offset, _TRUNCATE,
+                            " ds=%llX:%ux%u:f%u", static_cast<unsigned long long>(resource.handle),
+                            desc.texture.width, desc.texture.height,
+                            static_cast<unsigned>(desc.texture.format));
+            }
+        }
+        log_line("%s", line);
+    }
     if (count == 0 || rtvs == nullptr || rtvs[0].handle == 0 || dsv.handle == 0)
         return;
 
@@ -340,6 +387,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         auto *state = g_mapping.get();
         InterlockedExchange(&state->quality_mode, load_mode());
         g_diagnostics = GetPrivateProfileIntW(L"DOS2DLSS", L"Diagnostics", 1, g_config_path) != 0;
+        g_trace_frame = GetPrivateProfileIntW(L"DOS2DLSS", L"TraceFrame", 120, g_config_path);
 
         if (!register_with_reshade() || !register_callbacks())
         {
