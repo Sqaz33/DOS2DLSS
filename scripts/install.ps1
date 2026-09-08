@@ -85,6 +85,11 @@ foreach ($leaf in @('DLSS5 DX11 Bridge.addon64', 'renodx-dlss5.addon64')) {
         Move-Item -LiteralPath $disabled -Destination $active
     }
 }
+$nrBridge = Join-Path $BuildDirectory 'dos2-nr-bridge.addon64'
+if (-not $PauseNeuralRendering -and (Test-Path -LiteralPath $nrBridge)) {
+    Copy-Item -LiteralPath $nrBridge -Destination (Join-Path $bin 'DLSS5 DX11 Bridge.addon64') -Force
+}
+
 # DOS2 ships the Windows 8.1 SDK build of D3DCompiler. RenoDX's DLSS5 proxy
 # compiles a Shader Model 5.1 compute shader at runtime, which that old DLL
 # rejects with X3506. Let Windows load its current system copy instead, while
@@ -110,7 +115,10 @@ if (Test-Path -LiteralPath $bridgeConfig) {
     $text = Get-Content -LiteralPath $bridgeConfig -Raw
     $text = $text -replace '(?m)^synth\s*=.*$', 'synth=0'
     $text = $text -replace '(?m)^source\s*=.*$', 'source=auto'
-    $text = $text -replace '(?m)^skip_game\s*=.*$', 'skip_game=0'
+    $text = $text -replace '(?m)^skip_game\s*=.*$', 'skip_game=1'
+    if (-not $PauseNeuralRendering -and (Test-Path -LiteralPath $nrBridge)) {
+        $text = $text -replace '(?m)^stage\s*=.*$', 'stage=3'
+    }
     Set-Content -LiteralPath $bridgeConfig -Value $text -Encoding utf8NoBOM
 }
 
