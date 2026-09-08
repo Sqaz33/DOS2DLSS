@@ -66,6 +66,7 @@ int wmain(int argc, wchar_t **argv)
     wprintf(L"ngx_feature_result=0x%08lX\n", state->ngx_feature_result);
     wprintf(L"ngx_evaluate_result=0x%08lX\n", state->ngx_evaluate_result);
     wprintf(L"camera_motion_ready=%ld\n", state->camera_motion_ready);
+    wprintf(L"camera_jitter_ready=%ld\n", state->camera_jitter_ready);
     wprintf(L"native_dlss_active=%ld\n", state->native_dlss_active);
     wprintf(L"ngx_evaluated_frames=%lld\n", state->ngx_evaluated_frames);
     wprintf(L"frame=%lld\n", state->frame_number);

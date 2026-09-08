@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(DOS2DLSS VERSION 0.5.0 LANGUAGES CXX)
+project(DOS2DLSS VERSION 0.6.0 LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT MSVC)
   message(FATAL_ERROR "DOS2DLSS currently supports 64-bit Windows builds with MSVC only")

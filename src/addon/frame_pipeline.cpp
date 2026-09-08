@@ -23,7 +23,7 @@ cbuffer MotionConstants : register(b0)
     row_major float4x4 CurrentInverseViewProjection;
     row_major float4x4 PreviousViewProjection;
     float2 RenderSize;
-    float2 Padding;
+    float2 CurrentJitter;
 };
 
 Texture2D<float> SceneDepth : register(t0);
@@ -36,16 +36,17 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     float2 currentPixel = float2(id.xy) + 0.5;
     float2 currentUV = currentPixel / RenderSize;
+    float2 unjitteredUV = currentUV - CurrentJitter / RenderSize;
     float depth = SceneDepth.Load(int3(id.xy, 0));
-    float4 clip = float4(currentUV.x * 2.0 - 1.0,
-                         1.0 - currentUV.y * 2.0, depth, 1.0);
+    float4 clip = float4(unjitteredUV.x * 2.0 - 1.0,
+                         1.0 - unjitteredUV.y * 2.0, depth, 1.0);
     float4 world = mul(CurrentInverseViewProjection, clip);
     world /= world.w;
     float4 previousClip = mul(PreviousViewProjection, world);
     float2 previousUV = previousClip.xy / previousClip.w;
     previousUV = float2(previousUV.x * 0.5 + 0.5,
                         0.5 - previousUV.y * 0.5);
-    MotionOutput[id.xy] = (previousUV - currentUV) * RenderSize;
+    MotionOutput[id.xy] = (previousUV - unjitteredUV) * RenderSize;
 }
 )";
 
@@ -76,7 +77,7 @@ struct MotionConstants
     DirectX::XMFLOAT4X4 current_inverse_view_projection;
     DirectX::XMFLOAT4X4 previous_view_projection;
     float render_size[2];
-    float padding[2];
+    float current_jitter[2];
 };
 static_assert(sizeof(MotionConstants) == 144);
 }
@@ -360,6 +361,8 @@ ID3D11ShaderResourceView *FramePipeline::evaluate(
                 sizeof(previous_view_projection_));
     constants.render_size[0] = static_cast<float>(render_width);
     constants.render_size[1] = static_cast<float>(render_height);
+    constants.current_jitter[0] = jitter_x;
+    constants.current_jitter[1] = jitter_y;
 
     ID3D11ComputeShader *old_shader = nullptr;
     ID3D11Buffer *old_constants = nullptr;

@@ -20,7 +20,7 @@
 #include "reshade_api.hpp"
 #include "reshade_events.hpp"
 
-extern "C" __declspec(dllexport) const char *NAME = "DOS2 DLSS 0.5.0";
+extern "C" __declspec(dllexport) const char *NAME = "DOS2 DLSS 0.6.0";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Controls and diagnostics for the native Divinity: Original Sin 2 DLSS integration.";
 
@@ -44,6 +44,11 @@ wchar_t g_ngx_path[MAX_PATH] = {};
 dos2dlss::NgxRuntime g_ngx;
 dos2dlss::FramePipeline g_frame_pipeline;
 ID3D11Buffer *g_scaled_viewport_constants = nullptr;
+ID3D11Buffer *g_jittered_per_view_constants = nullptr;
+std::size_t g_jittered_per_view_size = 0;
+std::uint64_t g_jittered_per_view_source = 0;
+std::uint64_t g_jittered_per_view_hash = 0;
+LONG64 g_jittered_per_view_frame = -1;
 volatile LONG64 g_frame_draws = 0;
 volatile LONG64 g_frame_indexed_draws = 0;
 volatile LONG64 g_frame_target_binds = 0;
@@ -52,13 +57,14 @@ volatile LONG g_frame_scene_h = 0;
 volatile LONG g_frame_color_format = 0;
 volatile LONG g_frame_depth_format = 0;
 volatile LONG64 g_native_ui_resource = 0;
-bool g_diagnostics = true;
+bool g_diagnostics = false;
 constexpr std::uint64_t kCombineUiPixelShader = 0x7D52DF001176EB8Dull;
 constexpr std::uint64_t kNativeUiAllocationSite = 0x1EE8A2Eull;
 thread_local int g_current_screen_level = -1;
 thread_local bool g_current_native_ui_target = false;
 thread_local bool g_current_gbuffer_target = false;
 thread_local bool g_current_scene_depth_target = false;
+thread_local bool g_camera_override_bound = false;
 volatile LONG64 g_scene_depth_resource = 0;
 std::uintptr_t g_exe_base = 0;
 std::uintptr_t g_exe_end = 0;
@@ -443,6 +449,16 @@ void on_destroy_device(reshade::api::device *)
         g_scaled_viewport_constants->Release();
         g_scaled_viewport_constants = nullptr;
     }
+    if (g_jittered_per_view_constants != nullptr)
+    {
+        g_jittered_per_view_constants->Release();
+        g_jittered_per_view_constants = nullptr;
+    }
+    g_jittered_per_view_size = 0;
+    g_jittered_per_view_source = 0;
+    g_jittered_per_view_hash = 0;
+    g_jittered_per_view_frame = -1;
+    g_camera_override_bound = false;
     g_frame_pipeline.shutdown();
     g_ngx.shutdown(g_mapping.get(), &log_message);
 }
@@ -524,7 +540,7 @@ void get_frame_jitter(dos2dlss::SharedState *state, float &x, float &y)
 }
 
 void bind_viewport_uv_constants(ID3D11DeviceContext *context, bool scaled,
-                                bool force_identity, float scale_x, float scale_y)
+                                float scale_x, float scale_y)
 {
     const auto &range = g_bound_vertex_constant_buffers[0];
     if (context == nullptr || range.buffer.handle == 0 || range.offset != 0)
@@ -532,7 +548,7 @@ void bind_viewport_uv_constants(ID3D11DeviceContext *context, bool scaled,
 
     auto *original = reinterpret_cast<ID3D11Buffer *>(range.buffer.handle);
     context->VSSetConstantBuffers(0, 1, &original);
-    if (!scaled && !force_identity)
+    if (!scaled)
         return;
 
     BufferSnapshot snapshot;
@@ -569,20 +585,10 @@ void bind_viewport_uv_constants(ID3D11DeviceContext *context, bool scaled,
     }
 
     auto *values = reinterpret_cast<float *>(snapshot.bytes.data());
-    if (force_identity)
-    {
-        values[0] = 1.0f;
-        values[1] = 1.0f;
-        values[2] = 0.0f;
-        values[3] = 0.0f;
-    }
-    else
-    {
-        values[0] *= scale_x;
-        values[1] *= scale_y;
-        values[2] *= scale_x;
-        values[3] *= scale_y;
-    }
+    values[0] *= scale_x;
+    values[1] *= scale_y;
+    values[2] *= scale_x;
+    values[3] *= scale_y;
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (FAILED(context->Map(g_scaled_viewport_constants, 0, D3D11_MAP_WRITE_DISCARD,
                             0, &mapped)))
@@ -590,6 +596,124 @@ void bind_viewport_uv_constants(ID3D11DeviceContext *context, bool scaled,
     std::memcpy(mapped.pData, snapshot.bytes.data(), snapshot.bytes.size());
     context->Unmap(g_scaled_viewport_constants, 0);
     context->VSSetConstantBuffers(0, 1, &g_scaled_viewport_constants);
+}
+
+void restore_camera_constants(ID3D11DeviceContext *context)
+{
+    if (context == nullptr || !g_camera_override_bound)
+        return;
+    const auto &vertex = g_bound_vertex_constant_buffers[12];
+    const auto &pixel = g_bound_pixel_constant_buffers[12];
+    if (vertex.buffer.handle != 0 && vertex.offset == 0)
+    {
+        auto *buffer = reinterpret_cast<ID3D11Buffer *>(vertex.buffer.handle);
+        context->VSSetConstantBuffers(12, 1, &buffer);
+    }
+    if (pixel.buffer.handle != 0 && pixel.offset == 0)
+    {
+        auto *buffer = reinterpret_cast<ID3D11Buffer *>(pixel.buffer.handle);
+        context->PSSetConstantBuffers(12, 1, &buffer);
+    }
+    g_camera_override_bound = false;
+}
+
+bool bind_jittered_camera_constants(ID3D11DeviceContext *context,
+                                    dos2dlss::SharedState *state,
+                                    float jitter_x, float jitter_y,
+                                    float render_width, float render_height)
+{
+    if (context == nullptr || state == nullptr || render_width <= 0.0f ||
+        render_height <= 0.0f)
+        return false;
+    const auto &vertex = g_bound_vertex_constant_buffers[12];
+    const auto &pixel = g_bound_pixel_constant_buffers[12];
+    const auto source = vertex.buffer.handle != 0 && vertex.offset == 0 ? vertex : pixel;
+    if (source.buffer.handle == 0 || source.offset != 0)
+        return false;
+
+    BufferSnapshot snapshot;
+    bool found = false;
+    AcquireSRWLockShared(&g_pipeline_lock);
+    const auto entry = g_buffer_snapshots.find(source.buffer.handle);
+    if (entry != g_buffer_snapshots.end() && entry->second.size >= sizeof(float) * 48)
+    {
+        snapshot = entry->second;
+        found = true;
+    }
+    ReleaseSRWLockShared(&g_pipeline_lock);
+    if (!found || snapshot.size % 16 != 0)
+        return false;
+
+    auto *values = reinterpret_cast<float *>(snapshot.bytes.data());
+    for (std::size_t i = 0; i < 48; ++i)
+        if (!std::isfinite(values[i]))
+            return false;
+
+    // DOS2 stores column-vector matrices in row-major memory. Add the clip-space
+    // offset to the projection and view-projection rows, while retaining the
+    // original unjittered buffer for motion-vector reconstruction.
+    const float clip_x = 2.0f * jitter_x / render_width;
+    const float clip_y = -2.0f * jitter_y / render_height;
+    const auto jitter_matrix = [clip_x, clip_y](float *matrix)
+    {
+        for (std::size_t column = 0; column < 4; ++column)
+        {
+            matrix[column] += clip_x * matrix[12 + column];
+            matrix[4 + column] += clip_y * matrix[12 + column];
+        }
+    };
+    jitter_matrix(values + 16);
+    jitter_matrix(values + 32);
+
+    const auto frame = InterlockedCompareExchange64(&state->frame_number, 0, 0);
+    const auto contents_hash = hash_shader(snapshot.bytes.data(), snapshot.size);
+    const bool upload = g_jittered_per_view_constants == nullptr ||
+        g_jittered_per_view_size != snapshot.size ||
+        g_jittered_per_view_source != source.buffer.handle ||
+        g_jittered_per_view_hash != contents_hash ||
+        g_jittered_per_view_frame != frame;
+    if (g_jittered_per_view_constants == nullptr ||
+        g_jittered_per_view_size != snapshot.size)
+    {
+        if (g_jittered_per_view_constants != nullptr)
+            g_jittered_per_view_constants->Release();
+        g_jittered_per_view_constants = nullptr;
+        ID3D11Device *device = nullptr;
+        context->GetDevice(&device);
+        if (device == nullptr)
+            return false;
+        D3D11_BUFFER_DESC desc = {};
+        desc.ByteWidth = static_cast<UINT>(snapshot.size);
+        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        const HRESULT created = device->CreateBuffer(
+            &desc, nullptr, &g_jittered_per_view_constants);
+        device->Release();
+        if (FAILED(created))
+        {
+            log_line("Jittered camera constant buffer creation failed: 0x%08lX.", created);
+            return false;
+        }
+        g_jittered_per_view_size = snapshot.size;
+    }
+    if (upload)
+    {
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(context->Map(g_jittered_per_view_constants, 0,
+                                D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+            return false;
+        std::memcpy(mapped.pData, snapshot.bytes.data(), snapshot.size);
+        context->Unmap(g_jittered_per_view_constants, 0);
+        g_jittered_per_view_source = source.buffer.handle;
+        g_jittered_per_view_hash = contents_hash;
+        g_jittered_per_view_frame = frame;
+    }
+    context->VSSetConstantBuffers(12, 1, &g_jittered_per_view_constants);
+    context->PSSetConstantBuffers(12, 1, &g_jittered_per_view_constants);
+    g_camera_override_bound = true;
+    InterlockedExchange(&state->camera_jitter_ready, 1);
+    return true;
 }
 
 void prepare_draw_resolution(reshade::api::command_list *cmd)
@@ -619,12 +743,18 @@ void prepare_draw_resolution(reshade::api::command_list *cmd)
     if (mode == static_cast<LONG>(dos2dlss::QualityMode::dlaa))
     {
         if (!g_current_scene_depth_target)
+        {
+            restore_camera_constants(context);
             return;
+        }
         float jitter_x = 0.0f;
         float jitter_y = 0.0f;
         get_frame_jitter(state, jitter_x, jitter_y);
+        bind_jittered_camera_constants(context, state, jitter_x, jitter_y,
+                                       static_cast<float>(output_width),
+                                       static_cast<float>(output_height));
         const D3D11_VIEWPORT viewport = {
-            jitter_x, jitter_y, static_cast<float>(output_width),
+            0.0f, 0.0f, static_cast<float>(output_width),
             static_cast<float>(output_height), 0.0f, 1.0f };
         const D3D11_RECT scissor = { 0, 0, output_width, output_height };
         context->RSSetViewports(1, &viewport);
@@ -633,14 +763,18 @@ void prepare_draw_resolution(reshade::api::command_list *cmd)
     }
 
     if (render_width >= output_width || render_height >= output_height)
+    {
+        restore_camera_constants(context);
         return;
+    }
     const bool fullscreen = is_fullscreen_vertex_shader(g_bound_vertex_shader);
+    if (!g_current_scene_depth_target || fullscreen)
+        restore_camera_constants(context);
     // The final combine samples our already full-resolution DLSS output and
     // the native UI. Scaling its shared interpolator would zoom both inputs.
     const bool scale_uv = fullscreen && !g_current_native_ui_target &&
                           g_bound_pixel_shader != kCombineUiPixelShader;
     bind_viewport_uv_constants(context, scale_uv,
-        fullscreen && g_bound_pixel_shader == kCombineUiPixelShader,
         static_cast<float>(render_width) / static_cast<float>(output_width),
         static_cast<float>(render_height) / static_cast<float>(output_height));
     if (g_current_screen_level < 0 && !g_current_native_ui_target)
@@ -657,12 +791,17 @@ void prepare_draw_resolution(reshade::api::command_list *cmd)
         ? (std::max)(1L, render_height >> g_current_screen_level) : native_height;
     const float width = static_cast<float>(desired_width);
     const float height = static_cast<float>(desired_height);
-    float viewport_x = 0.0f;
-    float viewport_y = 0.0f;
-    if (g_current_scene_depth_target)
-        get_frame_jitter(state, viewport_x, viewport_y);
+    if (g_current_scene_depth_target && !fullscreen)
+    {
+        float jitter_x = 0.0f;
+        float jitter_y = 0.0f;
+        get_frame_jitter(state, jitter_x, jitter_y);
+        bind_jittered_camera_constants(context, state, jitter_x, jitter_y,
+                                       static_cast<float>(render_width),
+                                       static_cast<float>(render_height));
+    }
     const D3D11_VIEWPORT viewport = {
-        viewport_x, viewport_y, width, height, 0.0f, 1.0f };
+        0.0f, 0.0f, width, height, 0.0f, 1.0f };
     const D3D11_RECT scissor = { 0, 0, static_cast<LONG>(width), static_cast<LONG>(height) };
     context->RSSetViewports(1, &viewport);
     context->RSSetScissorRects(1, &scissor);
@@ -1017,13 +1156,19 @@ void on_push_descriptors(reshade::api::command_list *, reshade::api::shader_stag
             // Calls made through the D3D11 context can be reflected back as
             // ReShade events. Do not mistake our temporary override for the
             // constant buffer the game intends to bind on later draws.
-            const bool internal_viewport_buffer = g_scaled_viewport_constants != nullptr &&
-                buffers[i].buffer.handle == reinterpret_cast<std::uint64_t>(
-                    g_scaled_viewport_constants);
-            if (vertex && !internal_viewport_buffer)
+            const bool internal_buffer =
+                (g_scaled_viewport_constants != nullptr &&
+                 buffers[i].buffer.handle == reinterpret_cast<std::uint64_t>(
+                    g_scaled_viewport_constants)) ||
+                (g_jittered_per_view_constants != nullptr &&
+                 buffers[i].buffer.handle == reinterpret_cast<std::uint64_t>(
+                    g_jittered_per_view_constants));
+            if (vertex && !internal_buffer)
                 g_bound_vertex_constant_buffers[update.binding + i] = buffers[i];
-            if (pixel)
+            if (pixel && !internal_buffer)
                 g_bound_pixel_constant_buffers[update.binding + i] = buffers[i];
+            if (!internal_buffer && update.binding + i == 12)
+                g_camera_override_bound = false;
         }
     }
 }
@@ -1197,6 +1342,7 @@ void on_present(reshade::api::command_queue *queue, reshade::api::swapchain *,
             g_frame_pipeline.reset_history();
             InterlockedExchange(&state->native_dlss_active, 0);
             InterlockedExchange(&state->camera_motion_ready, 0);
+            InterlockedExchange(&state->camera_jitter_ready, 0);
         }
         g_ngx.sync_feature(context, mode,
                            static_cast<std::uint32_t>(state->backbuffer_width),
@@ -1353,6 +1499,8 @@ void draw_panel(reshade::api::effect_runtime *)
                state->native_dlss_active ? mode_name(mode) : "waiting",
                state->camera_motion_ready ? "ready" : "waiting",
                state->ngx_evaluate_result, state->ngx_evaluated_frames);
+    panel_line("Projection jitter: %s",
+               state->camera_jitter_ready ? "active on 3D camera" : "waiting");
     panel_line("Back buffer: %ld x %ld", state->backbuffer_width, state->backbuffer_height);
     panel_line("DLSS contract: %ld x %ld -> %ld x %ld",
                state->render_width, state->render_height,
@@ -1373,8 +1521,9 @@ void draw_panel(reshade::api::effect_runtime *)
     }
 
     g_ui->SeparatorText("Pipeline");
-    panel_line("DOS2 native data -> NGX D3D11 -> DLSS 5 Bridge -> RenoDX DLSS 5");
-    panel_line("Feeder is not used. Bridge synthesis must be disabled.");
+    panel_line("DOS2 native data -> NVIDIA NGX D3D11 -> native CombineUI");
+    panel_line("DLSS 5 Bridge is optional and currently paused for native-DLSS testing.");
+    panel_line("Feeder is not used.");
 }
 
 bool register_callbacks()
@@ -1454,7 +1603,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         }
         InterlockedExchange(&state->addon_ready, 1);
         update_status(L"ReShade probe panel registered.");
-        log_line("DOS2 DLSS 0.5.0 registered with ReShade.");
+        log_line("DOS2 DLSS 0.6.0 registered with ReShade.");
     }
     else if (reason == DLL_PROCESS_DETACH && reserved == nullptr)
     {

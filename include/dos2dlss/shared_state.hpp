@@ -7,7 +7,7 @@ namespace dos2dlss
 {
 inline constexpr wchar_t kSharedMappingName[] = L"Local\\DOS2DLSS_State_v5";
 inline constexpr std::uint32_t kSharedMagic = 0x35534C44; // "DLS5"
-inline constexpr std::uint32_t kSharedVersion = 6;
+inline constexpr std::uint32_t kSharedVersion = 7;
 
 enum class QualityMode : LONG
 {
@@ -40,6 +40,7 @@ struct SharedState
     volatile LONG ngx_feature_result;
     volatile LONG ngx_evaluate_result;
     volatile LONG camera_motion_ready;
+    volatile LONG camera_jitter_ready;
     volatile LONG native_dlss_active;
     volatile LONG64 frame_number;
     volatile LONG64 draw_calls;
