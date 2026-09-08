@@ -1,7 +1,9 @@
 #include "dos2dlss/shared_state.hpp"
+#include "ngx_runtime.hpp"
 
 #include <windows.h>
 #include <psapi.h>
+#include <d3d11.h>
 
 #include <cstdarg>
 #include <cstdio>
@@ -11,7 +13,7 @@
 #include "reshade_api.hpp"
 #include "reshade_events.hpp"
 
-extern "C" __declspec(dllexport) const char *NAME = "DOS2 DLSS 0.1.0";
+extern "C" __declspec(dllexport) const char *NAME = "DOS2 DLSS 0.2.0";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Controls and diagnostics for the native Divinity: Original Sin 2 DLSS integration.";
 
@@ -29,6 +31,8 @@ UnregisterAddonFn g_unregister = nullptr;
 dos2dlss::SharedMapping g_mapping;
 wchar_t g_config_path[MAX_PATH] = {};
 wchar_t g_log_path[MAX_PATH] = {};
+wchar_t g_ngx_path[MAX_PATH] = {};
+dos2dlss::NgxRuntime g_ngx;
 volatile LONG64 g_frame_draws = 0;
 volatile LONG64 g_frame_indexed_draws = 0;
 volatile LONG64 g_frame_target_binds = 0;
@@ -51,6 +55,11 @@ void log_line(const char *format, ...)
     va_end(args);
     fputc('\n', file);
     fclose(file);
+}
+
+void log_message(const char *message)
+{
+    log_line("%s", message != nullptr ? message : "");
 }
 
 void make_sibling_path(HMODULE module, const wchar_t *leaf, wchar_t (&out)[MAX_PATH])
@@ -111,9 +120,20 @@ void on_init_device(reshade::api::device *device)
     if (device == nullptr)
         return;
     if (device->get_api() == reshade::api::device_api::d3d11)
-        update_status(L"D3D11 probe active; NGX feature is not created in milestone 0.1.0.");
+    {
+        auto *native_device = reinterpret_cast<ID3D11Device *>(device->get_native());
+        if (g_ngx.initialize(native_device, g_ngx_path, g_mapping.get(), &log_message))
+            update_status(L"D3D11 active; NVIDIA NGX initialized.");
+        else
+            update_status(L"D3D11 active; NVIDIA NGX initialization failed. See dos2-dlss.log.");
+    }
     else
         update_status(L"Unsupported graphics API: DOS2DLSS requires D3D11.");
+}
+
+void on_destroy_device(reshade::api::device *)
+{
+    g_ngx.shutdown(g_mapping.get(), &log_message);
 }
 
 void on_init_swapchain(reshade::api::swapchain *swapchain, bool)
@@ -227,13 +247,22 @@ void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
     }
 }
 
-void on_present(reshade::api::command_queue *, reshade::api::swapchain *,
+void on_present(reshade::api::command_queue *queue, reshade::api::swapchain *,
                 const reshade::api::rect *, const reshade::api::rect *,
                 std::uint32_t, const reshade::api::rect *)
 {
     auto *state = g_mapping.get();
     if (state == nullptr)
         return;
+    if (queue != nullptr)
+    {
+        auto *context = reinterpret_cast<ID3D11DeviceContext *>(queue->get_native());
+        const int mode = static_cast<int>(InterlockedCompareExchange(&state->quality_mode, 0, 0));
+        g_ngx.sync_feature(context, mode,
+                           static_cast<std::uint32_t>(state->backbuffer_width),
+                           static_cast<std::uint32_t>(state->backbuffer_height),
+                           state, &log_message);
+    }
     InterlockedIncrement64(&state->frame_number);
     InterlockedExchange64(&state->draw_calls, InterlockedExchange64(&g_frame_draws, 0));
     InterlockedExchange64(&state->indexed_draw_calls, InterlockedExchange64(&g_frame_indexed_draws, 0));
@@ -323,7 +352,7 @@ void draw_panel(reshade::api::effect_runtime *)
         InterlockedExchange(&state->quality_mode, mode);
         save_int(L"Mode", mode);
     }
-    panel_line("Selected: %s. Probe 0.1.0 does not run NGX yet.", mode_name(mode));
+    panel_line("Selected: %s.", mode_name(mode));
 
     bool reset = false;
     if (g_ui->Checkbox("Reset DLSS history on the next frame", &reset) && reset)
@@ -332,9 +361,16 @@ void draw_panel(reshade::api::effect_runtime *)
     g_ui->SeparatorText("Runtime");
     panel_line("Native module: %s", InterlockedCompareExchange(&state->native_ready, 0, 0) ? "loaded" : "not loaded");
     panel_line("Game build: %s (%ls)", InterlockedCompareExchange(&state->exact_game_build, 0, 0) ? "verified" : "not verified", state->game_version);
-    panel_line("ReShade add-on: loaded; NGX feature: %s",
+    panel_line("NVIDIA NGX: %s; DLSS available: %s; feature: %s",
+               InterlockedCompareExchange(&state->ngx_initialized, 0, 0) ? "initialized" : "not initialized",
+               InterlockedCompareExchange(&state->ngx_available, 0, 0) ? "yes" : "no",
                InterlockedCompareExchange(&state->ngx_feature_created, 0, 0) ? "created" : "not created");
+    panel_line("NGX results: init 0x%08lX, capability 0x%08lX, feature 0x%08lX",
+               state->ngx_init_result, state->ngx_capability_result, state->ngx_feature_result);
     panel_line("Back buffer: %ld x %ld", state->backbuffer_width, state->backbuffer_height);
+    panel_line("DLSS contract: %ld x %ld -> %ld x %ld",
+               state->render_width, state->render_height,
+               state->backbuffer_width, state->backbuffer_height);
     panel_line("Largest color+depth pass this frame: %ld x %ld", state->scene_width, state->scene_height);
 
     if (g_ui->Checkbox("Collect per-draw diagnostics", &g_diagnostics))
@@ -362,6 +398,7 @@ bool register_callbacks()
         return false;
 
     reg(reshade::addon_event::init_device, reinterpret_cast<void *>(&on_init_device));
+    reg(reshade::addon_event::destroy_device, reinterpret_cast<void *>(&on_destroy_device));
     reg(reshade::addon_event::init_swapchain, reinterpret_cast<void *>(&on_init_swapchain));
     reg(reshade::addon_event::draw, reinterpret_cast<void *>(&on_draw));
     reg(reshade::addon_event::draw_indexed, reinterpret_cast<void *>(&on_draw_indexed));
@@ -391,6 +428,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         DisableThreadLibraryCalls(module);
         make_sibling_path(module, L"dos2-dlss.ini", g_config_path);
         make_sibling_path(module, L"dos2-dlss.log", g_log_path);
+        make_sibling_path(module, L"DOS2DLSS-NGX", g_ngx_path);
         FILE *clear = nullptr;
         if (_wfopen_s(&clear, g_log_path, L"w") == 0 && clear != nullptr) fclose(clear);
 
@@ -408,7 +446,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         }
         InterlockedExchange(&state->addon_ready, 1);
         update_status(L"ReShade probe panel registered.");
-        log_line("DOS2 DLSS 0.1.0 registered with ReShade.");
+        log_line("DOS2 DLSS 0.2.0 registered with ReShade.");
     }
     else if (reason == DLL_PROCESS_DETACH && reserved == nullptr)
     {

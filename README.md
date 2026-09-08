@@ -14,7 +14,10 @@ DLSS5 Feeder is not part of this design.
 
 ## Status
 
-Research is complete enough to begin implementation. The first executable milestone is a safe diagnostic build that identifies the game and records D3D11 render passes without changing the picture.
+Milestone 0.2 initializes the official NVIDIA NGX D3D11 runtime, checks DLSS
+availability and creates a real DLSS feature contract for the selected quality
+mode. DLSS5 DX11 Bridge recognizes that contract as game supplied. Evaluation is
+kept disabled until the mod has identified DOS2's HUD-less scene color, depth
+and motion-vector inputs, so this milestone does not alter the picture.
 
 Target game build: `3.6.117.3735`.
-

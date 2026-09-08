@@ -1,5 +1,6 @@
 build/
 dist/
+artifacts/
 *.user
 *.log
 *.pdb
@@ -9,4 +10,3 @@ dist/
 *.lib
 build-errors.txt
 .vs/
-

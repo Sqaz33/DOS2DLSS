@@ -20,11 +20,21 @@ set_target_properties(DOS2DLSSNative PROPERTIES PREFIX "" OUTPUT_NAME "DOS2DLSSN
 
 add_library(dos2_dlss_addon SHARED
   src/addon/addon.cpp
+  src/addon/ngx_runtime.cpp
 )
-target_include_directories(dos2_dlss_addon PRIVATE include third_party/reshade)
+target_include_directories(dos2_dlss_addon PRIVATE
+  include
+  third_party/reshade
+  third_party/nvidia_dlss/include
+)
 target_compile_definitions(dos2_dlss_addon PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_compile_options(dos2_dlss_addon PRIVATE /W4 /permissive- /EHsc)
-target_link_libraries(dos2_dlss_addon PRIVATE version)
+target_link_libraries(dos2_dlss_addon PRIVATE
+  version
+  d3d11
+  dxgi
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvidia_dlss/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib"
+)
 set_target_properties(dos2_dlss_addon PROPERTIES
   PREFIX ""
   OUTPUT_NAME "dos2-dlss"
