@@ -25,7 +25,8 @@ public:
     bool evaluate(ID3D11DeviceContext *context, ID3D11Resource *color,
                   ID3D11Resource *output, ID3D11Resource *depth,
                   ID3D11Resource *motion_vectors, std::uint32_t render_width,
-                  std::uint32_t render_height, bool reset,
+                  std::uint32_t render_height, float jitter_x, float jitter_y,
+                  bool reset,
                   SharedState *state, LogFn log);
     void shutdown(SharedState *state, LogFn log);
 

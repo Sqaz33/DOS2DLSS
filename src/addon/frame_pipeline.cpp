@@ -203,6 +203,8 @@ bool FramePipeline::ensure_resources(std::uint32_t render_width,
         return true;
     release(motion_uav_);
     release(motion_texture_);
+    release(compact_color_);
+    compact_color_format_ = 0;
     release(output_view_);
     release(output_texture_);
     render_width_ = 0;
@@ -257,15 +259,75 @@ bool FramePipeline::ensure_resources(std::uint32_t render_width,
     return true;
 }
 
+ID3D11Resource *FramePipeline::prepare_color_input(
+    ID3D11DeviceContext *context, ID3D11Resource *color,
+    std::uint32_t render_width, std::uint32_t render_height, LogFn log)
+{
+    if (context == nullptr || color == nullptr || device_ == nullptr)
+        return nullptr;
+    ID3D11Texture2D *source = nullptr;
+    if (FAILED(color->QueryInterface(IID_PPV_ARGS(&source))) || source == nullptr)
+        return nullptr;
+    D3D11_TEXTURE2D_DESC source_desc = {};
+    source->GetDesc(&source_desc);
+    if (source_desc.Width == render_width && source_desc.Height == render_height)
+    {
+        source->Release();
+        return color;
+    }
+    if (source_desc.Width < render_width || source_desc.Height < render_height ||
+        source_desc.SampleDesc.Count != 1)
+    {
+        source->Release();
+        return nullptr;
+    }
+
+    if (compact_color_ == nullptr || compact_color_format_ != source_desc.Format)
+    {
+        release(compact_color_);
+        D3D11_TEXTURE2D_DESC compact = source_desc;
+        compact.Width = render_width;
+        compact.Height = render_height;
+        compact.MipLevels = 1;
+        compact.ArraySize = 1;
+        compact.Usage = D3D11_USAGE_DEFAULT;
+        compact.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        compact.CPUAccessFlags = 0;
+        compact.MiscFlags = 0;
+        ID3D11Texture2D *texture = nullptr;
+        const HRESULT result = device_->CreateTexture2D(&compact, nullptr, &texture);
+        if (FAILED(result) || texture == nullptr)
+        {
+            write_log(log, "Compact DLSS color creation failed: 0x%08lX.", result);
+            source->Release();
+            return nullptr;
+        }
+        compact_color_ = texture;
+        compact_color_format_ = source_desc.Format;
+        write_log(log, "Compact DLSS color created: %ux%u format %u.",
+                  render_width, render_height, source_desc.Format);
+    }
+
+    const D3D11_BOX box = { 0, 0, 0, render_width, render_height, 1 };
+    context->CopySubresourceRegion(compact_color_, 0, 0, 0, 0, source, 0, &box);
+    source->Release();
+    return compact_color_;
+}
+
 ID3D11ShaderResourceView *FramePipeline::evaluate(
     ID3D11DeviceContext *context, ID3D11Resource *color,
     const float current_view_projection[16], std::uint32_t render_width,
     std::uint32_t render_height, std::uint32_t output_width,
-    std::uint32_t output_height, bool reset, NgxRuntime &ngx,
+    std::uint32_t output_height, float jitter_x, float jitter_y,
+    bool reset, NgxRuntime &ngx,
     SharedState *state, LogFn log)
 {
     if (context == nullptr || color == nullptr || current_view_projection == nullptr ||
         !ensure_resources(render_width, render_height, output_width, output_height, log))
+        return nullptr;
+    ID3D11Resource *ngx_color = prepare_color_input(
+        context, color, render_width, render_height, log);
+    if (ngx_color == nullptr)
         return nullptr;
 
     using namespace DirectX;
@@ -330,9 +392,9 @@ ID3D11ShaderResourceView *FramePipeline::evaluate(
     release(old_output);
 
     InterlockedExchange(&state->camera_motion_ready, 1);
-    const bool succeeded = ngx.evaluate(context, color, output_texture_, scene_depth_,
+    const bool succeeded = ngx.evaluate(context, ngx_color, output_texture_, scene_depth_,
                                         motion_texture_, render_width, render_height,
-                                        reset, state, log);
+                                        jitter_x, jitter_y, reset, state, log);
     std::memcpy(previous_view_projection_, current_view_projection,
                 sizeof(previous_view_projection_));
     has_previous_camera_ = true;
@@ -345,6 +407,8 @@ void FramePipeline::shutdown()
     release(output_texture_);
     release(motion_uav_);
     release(motion_texture_);
+    release(compact_color_);
+    compact_color_format_ = 0;
     release(depth_view_);
     release(scene_depth_);
     release(motion_constants_);

@@ -30,6 +30,7 @@ public:
                                        std::uint32_t render_height,
                                        std::uint32_t output_width,
                                        std::uint32_t output_height,
+                                       float jitter_x, float jitter_y,
                                        bool reset, NgxRuntime &ngx,
                                        SharedState *state, LogFn log);
     void shutdown();
@@ -38,6 +39,11 @@ private:
     bool ensure_resources(std::uint32_t render_width, std::uint32_t render_height,
                           std::uint32_t output_width, std::uint32_t output_height,
                           LogFn log);
+    ID3D11Resource *prepare_color_input(ID3D11DeviceContext *context,
+                                        ID3D11Resource *color,
+                                        std::uint32_t render_width,
+                                        std::uint32_t render_height,
+                                        LogFn log);
     bool create_depth_view(LogFn log);
 
     ID3D11Device *device_ = nullptr;
@@ -47,6 +53,8 @@ private:
     ID3D11ShaderResourceView *depth_view_ = nullptr;
     ID3D11Resource *motion_texture_ = nullptr;
     ID3D11UnorderedAccessView *motion_uav_ = nullptr;
+    ID3D11Resource *compact_color_ = nullptr;
+    std::uint32_t compact_color_format_ = 0;
     ID3D11Resource *output_texture_ = nullptr;
     ID3D11ShaderResourceView *output_view_ = nullptr;
     std::uint32_t render_width_ = 0;

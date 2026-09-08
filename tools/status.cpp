@@ -75,6 +75,7 @@ int wmain(int argc, wchar_t **argv)
     wprintf(L"backbuffer=%ldx%ld\n", state->backbuffer_width, state->backbuffer_height);
     wprintf(L"scene_candidate=%ldx%ld\n", state->scene_width, state->scene_height);
     wprintf(L"dlss_render_size=%ldx%ld\n", state->render_width, state->render_height);
+    wprintf(L"jitter=%.6f,%.6f\n", state->jitter_x, state->jitter_y);
     wprintf(L"capture_requested=%ld\n", state->capture_requested);
     wprintf(L"capture_complete=%ld\n", state->capture_complete);
     wprintf(L"captured_pass_count=%ld\n", state->captured_pass_count);

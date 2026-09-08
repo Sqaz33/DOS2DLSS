@@ -20,7 +20,7 @@
 #include "reshade_api.hpp"
 #include "reshade_events.hpp"
 
-extern "C" __declspec(dllexport) const char *NAME = "DOS2 DLSS 0.4.0";
+extern "C" __declspec(dllexport) const char *NAME = "DOS2 DLSS 0.5.0";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Controls and diagnostics for the native Divinity: Original Sin 2 DLSS integration.";
 
@@ -57,6 +57,7 @@ constexpr std::uint64_t kCombineUiPixelShader = 0x7D52DF001176EB8Dull;
 constexpr std::uint64_t kNativeUiAllocationSite = 0x1EE8A2Eull;
 thread_local int g_current_screen_level = -1;
 thread_local bool g_current_native_ui_target = false;
+thread_local bool g_current_gbuffer_target = false;
 std::uintptr_t g_exe_base = 0;
 std::uintptr_t g_exe_end = 0;
 
@@ -489,6 +490,37 @@ bool is_fullscreen_vertex_shader(std::uint64_t shader)
     }
 }
 
+float halton(std::uint64_t index, std::uint32_t base)
+{
+    float value = 0.0f;
+    float fraction = 1.0f;
+    while (index != 0)
+    {
+        fraction /= static_cast<float>(base);
+        value += fraction * static_cast<float>(index % base);
+        index /= base;
+    }
+    return value;
+}
+
+void get_frame_jitter(dos2dlss::SharedState *state, float &x, float &y)
+{
+    x = 0.0f;
+    y = 0.0f;
+    if (state == nullptr)
+        return;
+    const LONG mode = InterlockedCompareExchange(&state->quality_mode, 0, 0);
+    if (mode <= static_cast<LONG>(dos2dlss::QualityMode::off))
+        return;
+    static constexpr std::uint32_t phases[] = { 1, 8, 18, 24, 32 };
+    const auto phase_count = phases[(std::min)(4L, mode)];
+    const auto frame = static_cast<std::uint64_t>(
+        InterlockedCompareExchange64(&state->frame_number, 0, 0));
+    const auto sample = frame % phase_count + 1;
+    x = halton(sample, 2) - 0.5f;
+    y = halton(sample, 3) - 0.5f;
+}
+
 void bind_viewport_uv_constants(ID3D11DeviceContext *context, bool scaled,
                                 bool force_identity, float scale_x, float scale_y)
 {
@@ -564,19 +596,41 @@ void prepare_draw_resolution(reshade::api::command_list *cmd)
     if (cmd == nullptr || state == nullptr)
         return;
     const LONG mode = InterlockedCompareExchange(&state->quality_mode, 0, 0);
-    if (mode < static_cast<LONG>(dos2dlss::QualityMode::quality))
+    if (mode <= static_cast<LONG>(dos2dlss::QualityMode::off))
         return;
 
     const LONG render_width = InterlockedCompareExchange(&state->render_width, 0, 0);
     const LONG render_height = InterlockedCompareExchange(&state->render_height, 0, 0);
     const LONG output_width = InterlockedCompareExchange(&state->backbuffer_width, 0, 0);
     const LONG output_height = InterlockedCompareExchange(&state->backbuffer_height, 0, 0);
-    if (render_width <= 0 || render_height <= 0 || output_width <= 0 || output_height <= 0 ||
-        render_width >= output_width || render_height >= output_height)
+    if (render_width <= 0 || render_height <= 0 || output_width <= 0 || output_height <= 0)
         return;
 
     auto *context = reinterpret_cast<ID3D11DeviceContext *>(cmd->get_native());
     if (context == nullptr)
+        return;
+
+    // DLAA keeps the native render dimensions, but still needs the same
+    // sub-pixel sample position that is supplied to NGX. Restrict the shifted
+    // viewport to the G-buffer pass so UI, shadow maps and screen-space passes
+    // retain their exact pixel coordinates.
+    if (mode == static_cast<LONG>(dos2dlss::QualityMode::dlaa))
+    {
+        if (!g_current_gbuffer_target)
+            return;
+        float jitter_x = 0.0f;
+        float jitter_y = 0.0f;
+        get_frame_jitter(state, jitter_x, jitter_y);
+        const D3D11_VIEWPORT viewport = {
+            jitter_x, jitter_y, static_cast<float>(output_width),
+            static_cast<float>(output_height), 0.0f, 1.0f };
+        const D3D11_RECT scissor = { 0, 0, output_width, output_height };
+        context->RSSetViewports(1, &viewport);
+        context->RSSetScissorRects(1, &scissor);
+        return;
+    }
+
+    if (render_width >= output_width || render_height >= output_height)
         return;
     const bool fullscreen = is_fullscreen_vertex_shader(g_bound_vertex_shader);
     // The final combine samples our already full-resolution DLSS output and
@@ -601,7 +655,12 @@ void prepare_draw_resolution(reshade::api::command_list *cmd)
         ? (std::max)(1L, render_height >> g_current_screen_level) : native_height;
     const float width = static_cast<float>(desired_width);
     const float height = static_cast<float>(desired_height);
-    const D3D11_VIEWPORT viewport = { 0.0f, 0.0f, width, height, 0.0f, 1.0f };
+    float viewport_x = 0.0f;
+    float viewport_y = 0.0f;
+    if (g_current_gbuffer_target)
+        get_frame_jitter(state, viewport_x, viewport_y);
+    const D3D11_VIEWPORT viewport = {
+        viewport_x, viewport_y, width, height, 0.0f, 1.0f };
     const D3D11_RECT scissor = { 0, 0, static_cast<LONG>(width), static_cast<LONG>(height) };
     context->RSSetViewports(1, &viewport);
     context->RSSetScissorRects(1, &scissor);
@@ -629,6 +688,12 @@ void evaluate_native_dlss(reshade::api::command_list *cmd)
     ReleaseSRWLockShared(&g_pipeline_lock);
     if (!have_camera)
         return;
+
+    float jitter_x = 0.0f;
+    float jitter_y = 0.0f;
+    get_frame_jitter(state, jitter_x, jitter_y);
+    state->jitter_x = jitter_x;
+    state->jitter_y = jitter_y;
 
     auto *context = reinterpret_cast<ID3D11DeviceContext *>(cmd->get_native());
     if (context == nullptr)
@@ -664,7 +729,7 @@ void evaluate_native_dlss(reshade::api::command_list *cmd)
     const bool reset = InterlockedExchange(&state->reset_requested, 0) != 0;
     ID3D11ShaderResourceView *output_view = g_frame_pipeline.evaluate(
         context, input_color, current_view_projection, render_width, render_height,
-        output_width, output_height,
+        output_width, output_height, jitter_x, jitter_y,
         reset, g_ngx, state, &log_message);
     input_color->Release();
     if (output_view != nullptr)
@@ -711,6 +776,7 @@ void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
         return;
     g_current_screen_level = -1;
     g_current_native_ui_target = false;
+    g_current_gbuffer_target = false;
     auto *bound_device = cmd->get_device();
     const auto *state = g_mapping.get();
     const auto output_width = state != nullptr ? static_cast<std::uint32_t>(
@@ -746,6 +812,33 @@ void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
                 g_current_screen_level = screen_level(desc.texture.width, desc.texture.height,
                                                       output_width, output_height);
             }
+        }
+    }
+    if (bound_device != nullptr && count == 4 && rtvs != nullptr &&
+        rtvs[0].handle != 0 && rtvs[1].handle != 0 && rtvs[2].handle != 0 &&
+        rtvs[3].handle != 0 && dsv.handle != 0 && output_width != 0)
+    {
+        const auto color_resource = bound_device->get_resource_from_view(rtvs[0]);
+        const auto second_resource = bound_device->get_resource_from_view(rtvs[1]);
+        const auto third_resource = bound_device->get_resource_from_view(rtvs[2]);
+        const auto fourth_resource = bound_device->get_resource_from_view(rtvs[3]);
+        const auto depth_resource = bound_device->get_resource_from_view(dsv);
+        if (color_resource.handle != 0 && second_resource.handle != 0 &&
+            third_resource.handle != 0 && fourth_resource.handle != 0 &&
+            depth_resource.handle != 0)
+        {
+            const auto color = bound_device->get_resource_desc(color_resource);
+            const auto second = bound_device->get_resource_desc(second_resource);
+            const auto third = bound_device->get_resource_desc(third_resource);
+            const auto fourth = bound_device->get_resource_desc(fourth_resource);
+            g_current_gbuffer_target = color.texture.width == output_width &&
+                color.texture.format == reshade::api::format::r11g11b10_float &&
+                second.texture.format == reshade::api::format::r16g16_float &&
+                third.texture.format == reshade::api::format::r8g8b8a8_unorm &&
+                fourth.texture.format == reshade::api::format::r8g8b8a8_unorm;
+            if (g_current_gbuffer_target)
+                g_frame_pipeline.set_scene_depth(
+                    reinterpret_cast<ID3D11Resource *>(depth_resource.handle));
         }
     }
     if (!g_diagnostics)
@@ -799,19 +892,6 @@ void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
     const auto color = device->get_resource_desc(color_resource);
     const auto depth = device->get_resource_desc(depth_resource);
 
-    if (count == 4 && color.texture.width == static_cast<std::uint32_t>(
-            InterlockedCompareExchange(&g_mapping.get()->backbuffer_width, 0, 0)) &&
-        color.texture.format == reshade::api::format::r11g11b10_float)
-    {
-        const auto second = device->get_resource_desc(device->get_resource_from_view(rtvs[1]));
-        const auto third = device->get_resource_desc(device->get_resource_from_view(rtvs[2]));
-        const auto fourth = device->get_resource_desc(device->get_resource_from_view(rtvs[3]));
-        if (second.texture.format == reshade::api::format::r16g16_float &&
-            third.texture.format == reshade::api::format::r8g8b8a8_unorm &&
-            fourth.texture.format == reshade::api::format::r8g8b8a8_unorm)
-            g_frame_pipeline.set_scene_depth(
-                reinterpret_cast<ID3D11Resource *>(depth_resource.handle));
-    }
     if (color.texture.width != depth.texture.width || color.texture.height != depth.texture.height)
         return;
 
@@ -1261,6 +1341,8 @@ void draw_panel(reshade::api::effect_runtime *)
     panel_line("DLSS contract: %ld x %ld -> %ld x %ld",
                state->render_width, state->render_height,
                state->backbuffer_width, state->backbuffer_height);
+    panel_line("Temporal jitter: %.4f, %.4f render pixels",
+               state->jitter_x, state->jitter_y);
     panel_line("Largest color+depth pass this frame: %ld x %ld", state->scene_width, state->scene_height);
 
     if (g_ui->Checkbox("Collect per-draw diagnostics", &g_diagnostics))
@@ -1356,7 +1438,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         }
         InterlockedExchange(&state->addon_ready, 1);
         update_status(L"ReShade probe panel registered.");
-        log_line("DOS2 DLSS 0.4.0 registered with ReShade.");
+        log_line("DOS2 DLSS 0.5.0 registered with ReShade.");
     }
     else if (reason == DLL_PROCESS_DETACH && reserved == nullptr)
     {

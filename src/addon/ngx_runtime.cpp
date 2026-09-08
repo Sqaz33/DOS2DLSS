@@ -181,7 +181,7 @@ void NgxRuntime::sync_feature(ID3D11DeviceContext *context, int mode,
     create.Feature.InPerfQualityValue = perf_quality;
     create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
                                   NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
-    create.InEnableOutputSubrects = false;
+    create.InEnableOutputSubrects = true;
 
     const NVSDK_NGX_Result create_result =
         NGX_D3D11_CREATE_DLSS_EXT(context, &feature_, parameters_, &create);
@@ -206,7 +206,8 @@ void NgxRuntime::sync_feature(ID3D11DeviceContext *context, int mode,
 bool NgxRuntime::evaluate(ID3D11DeviceContext *context, ID3D11Resource *color,
                           ID3D11Resource *output, ID3D11Resource *depth,
                           ID3D11Resource *motion_vectors, std::uint32_t render_width,
-                          std::uint32_t render_height, bool reset,
+                          std::uint32_t render_height, float jitter_x, float jitter_y,
+                          bool reset,
                           SharedState *state, LogFn log)
 {
     if (context == nullptr || feature_ == nullptr || parameters_ == nullptr ||
@@ -220,8 +221,8 @@ bool NgxRuntime::evaluate(ID3D11DeviceContext *context, ID3D11Resource *color,
     eval.Feature.InSharpness = 0.0f;
     eval.pInDepth = depth;
     eval.pInMotionVectors = motion_vectors;
-    eval.InJitterOffsetX = 0.0f;
-    eval.InJitterOffsetY = 0.0f;
+    eval.InJitterOffsetX = jitter_x;
+    eval.InJitterOffsetY = jitter_y;
     eval.InRenderSubrectDimensions.Width = render_width;
     eval.InRenderSubrectDimensions.Height = render_height;
     eval.InReset = reset ? 1 : 0;

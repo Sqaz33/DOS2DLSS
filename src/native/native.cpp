@@ -130,7 +130,7 @@ DWORD WINAPI initialize(LPVOID)
     FILE *clear = nullptr;
     if (_wfopen_s(&clear, g_log_path, L"w, ccs=UTF-8") == 0 && clear != nullptr)
         fclose(clear);
-    log_line(L"DOS2DLSSNative 0.4.0 starting");
+    log_line(L"DOS2DLSSNative 0.5.0 starting");
 
     if (!g_mapping.open_or_create())
     {
@@ -151,7 +151,7 @@ DWORD WINAPI initialize(LPVOID)
     InterlockedExchange(&state->exact_game_build, exact ? 1 : 0);
     InterlockedExchange(&state->native_ready, 1);
     wcscpy_s(state->native_status,
-             exact ? L"Game build verified; native DLSS milestone 0.4.0 is enabled."
+             exact ? L"Game build verified; native DLSS milestone 0.5.0 is enabled."
                    : L"Unknown game build; all future render hooks will remain disabled.");
 
     log_line(L"Host: %ls", exe);

@@ -7,7 +7,7 @@ namespace dos2dlss
 {
 inline constexpr wchar_t kSharedMappingName[] = L"Local\\DOS2DLSS_State_v5";
 inline constexpr std::uint32_t kSharedMagic = 0x35534C44; // "DLS5"
-inline constexpr std::uint32_t kSharedVersion = 5;
+inline constexpr std::uint32_t kSharedVersion = 6;
 
 enum class QualityMode : LONG
 {
@@ -54,6 +54,8 @@ struct SharedState
     volatile LONG scene_depth_format;
     volatile LONG render_width;
     volatile LONG render_height;
+    float jitter_x;
+    float jitter_y;
     wchar_t game_version[32];
     wchar_t game_sha256[65];
     wchar_t native_status[192];
