@@ -7,5 +7,6 @@ dist/
 *.obj
 *.exp
 *.lib
+build-errors.txt
 .vs/
 
