@@ -58,6 +58,8 @@ constexpr std::uint64_t kNativeUiAllocationSite = 0x1EE8A2Eull;
 thread_local int g_current_screen_level = -1;
 thread_local bool g_current_native_ui_target = false;
 thread_local bool g_current_gbuffer_target = false;
+thread_local bool g_current_scene_depth_target = false;
+volatile LONG64 g_scene_depth_resource = 0;
 std::uintptr_t g_exe_base = 0;
 std::uintptr_t g_exe_end = 0;
 
@@ -616,7 +618,7 @@ void prepare_draw_resolution(reshade::api::command_list *cmd)
     // retain their exact pixel coordinates.
     if (mode == static_cast<LONG>(dos2dlss::QualityMode::dlaa))
     {
-        if (!g_current_gbuffer_target)
+        if (!g_current_scene_depth_target)
             return;
         float jitter_x = 0.0f;
         float jitter_y = 0.0f;
@@ -657,7 +659,7 @@ void prepare_draw_resolution(reshade::api::command_list *cmd)
     const float height = static_cast<float>(desired_height);
     float viewport_x = 0.0f;
     float viewport_y = 0.0f;
-    if (g_current_gbuffer_target)
+    if (g_current_scene_depth_target)
         get_frame_jitter(state, viewport_x, viewport_y);
     const D3D11_VIEWPORT viewport = {
         viewport_x, viewport_y, width, height, 0.0f, 1.0f };
@@ -777,6 +779,7 @@ void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
     g_current_screen_level = -1;
     g_current_native_ui_target = false;
     g_current_gbuffer_target = false;
+    g_current_scene_depth_target = false;
     auto *bound_device = cmd->get_device();
     const auto *state = g_mapping.get();
     const auto output_width = state != nullptr ? static_cast<std::uint32_t>(
@@ -814,6 +817,14 @@ void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
             }
         }
     }
+    if (bound_device != nullptr && dsv.handle != 0)
+    {
+        const auto depth_resource = bound_device->get_resource_from_view(dsv);
+        const auto known_depth = static_cast<std::uint64_t>(
+            InterlockedCompareExchange64(&g_scene_depth_resource, 0, 0));
+        g_current_scene_depth_target = depth_resource.handle != 0 &&
+                                       depth_resource.handle == known_depth;
+    }
     if (bound_device != nullptr && count == 4 && rtvs != nullptr &&
         rtvs[0].handle != 0 && rtvs[1].handle != 0 && rtvs[2].handle != 0 &&
         rtvs[3].handle != 0 && dsv.handle != 0 && output_width != 0)
@@ -837,8 +848,13 @@ void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
                 third.texture.format == reshade::api::format::r8g8b8a8_unorm &&
                 fourth.texture.format == reshade::api::format::r8g8b8a8_unorm;
             if (g_current_gbuffer_target)
+            {
+                InterlockedExchange64(&g_scene_depth_resource,
+                                      static_cast<LONG64>(depth_resource.handle));
+                g_current_scene_depth_target = true;
                 g_frame_pipeline.set_scene_depth(
                     reinterpret_cast<ID3D11Resource *>(depth_resource.handle));
+            }
         }
     }
     if (!g_diagnostics)
