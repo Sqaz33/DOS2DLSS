@@ -271,11 +271,8 @@ ID3D11Resource *FramePipeline::prepare_color_input(
         return nullptr;
     D3D11_TEXTURE2D_DESC source_desc = {};
     source->GetDesc(&source_desc);
-    if (source_desc.Width == render_width && source_desc.Height == render_height)
-    {
-        source->Release();
-        return color;
-    }
+    // Use an independent input in DLAA too. Never feed a texture which is
+    // still bound to the game's render pipeline directly into NGX.
     if (source_desc.Width < render_width || source_desc.Height < render_height ||
         source_desc.SampleDesc.Count != 1)
     {

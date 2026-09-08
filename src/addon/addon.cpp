@@ -757,7 +757,7 @@ void prepare_draw_resolution(reshade::api::command_list *cmd)
     // retain their exact pixel coordinates.
     if (mode == static_cast<LONG>(dos2dlss::QualityMode::dlaa))
     {
-        if (!g_current_scene_depth_target)
+        if (!g_current_scene_depth_target || is_fullscreen_vertex_shader(g_bound_vertex_shader))
         {
             restore_camera_constants(context);
             return;
@@ -874,18 +874,9 @@ void evaluate_native_dlss(reshade::api::command_list *cmd)
         }
     }
     ID3D11ShaderResourceView *input_view = nullptr;
-    // Binding the DLSS output for CombineUI may persist into the next frame
-    // because DOS2 caches unchanged D3D11 bindings. ReShade still knows the
-    // texture requested by the game, provided our own bind is not fed back into
-    // descriptor tracking, so prefer that view over the physical context slot.
-    if (g_bound_pixel_inputs[0].handle != 0)
-    {
-        input_view = reinterpret_cast<ID3D11ShaderResourceView *>(
-            g_bound_pixel_inputs[0].handle);
-        input_view->AddRef();
-    }
-    else
-        context->PSGetShaderResources(0, 1, &input_view);
+    // Read a live COM reference; cached raw descriptor handles can be destroyed
+    // during level loads. DrawRasterScope restores this slot after composition.
+    context->PSGetShaderResources(0, 1, &input_view);
     if (input_view == nullptr)
         return;
     ID3D11Resource *input_color = nullptr;
@@ -920,6 +911,8 @@ thread_local bool g_submitting_draw = false;
 struct DrawRasterScope
 {
     ID3D11DeviceContext *context;
+    ID3D11ShaderResourceView *scene_input = nullptr;
+    bool restore_scene_input = false;
     UINT viewport_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
     UINT scissor_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
     D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
@@ -927,12 +920,22 @@ struct DrawRasterScope
     explicit DrawRasterScope(reshade::api::command_list *cmd)
         : context(reinterpret_cast<ID3D11DeviceContext *>(cmd->get_native()))
     {
+        restore_scene_input = g_bound_pixel_shader == kCombineUiPixelShader;
+        if (restore_scene_input)
+            context->PSGetShaderResources(0, 1, &scene_input);
         context->RSGetViewports(&viewport_count, viewports);
         context->RSGetScissorRects(&scissor_count, scissors);
         g_submitting_draw = true;
     }
     ~DrawRasterScope()
     {
+        if (restore_scene_input)
+        {
+            g_internal_srv_bind = true;
+            context->PSSetShaderResources(0, 1, &scene_input);
+            g_internal_srv_bind = false;
+            if (scene_input != nullptr) scene_input->Release();
+        }
         context->RSSetViewports(viewport_count, viewports);
         context->RSSetScissorRects(scissor_count, scissors);
         g_submitting_draw = false;
