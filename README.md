@@ -14,18 +14,26 @@ DLSS5 Feeder is not part of this design.
 
 ## Status
 
-Milestone 0.3 runs native DLAA in the game. The add-on identifies DOS2's final
+Milestone 0.4 runs native DLAA and Super Resolution in the game. The add-on identifies DOS2's final
 scene image before `CombineUI`, reads the real D24S8 scene depth, reconstructs
 camera motion in an RG16F GPU texture from the game's `PerView` matrices and
 calls the official NVIDIA NGX D3D11 evaluation function. The processed scene is
 fed back into `CombineUI`, so menus and HUD remain at native resolution.
 
+Quality, Balanced and Performance reduce the viewport used by the 3D render
+chain while leaving DOS2's full-size render-target pool intact. Full-screen
+passes receive an adjusted `VPtoRTScaleBias`, so every pass samples the active
+top-left subrectangle instead of repeatedly shrinking it. The UI resource is
+learned from the game's real `CombineUI` binding and stays at output resolution.
+
 DLSS5 DX11 Bridge recognizes both feature creation and every evaluation as
 game-supplied DLSS, with synthesis disabled. RenoDX DLSS 5 can therefore be
 enabled from its existing ReShade tab. DLSS5 Feeder is not used.
 
-DLAA is the validated mode. Quality, Balanced and Performance already create
-the correct NGX feature sizes, but evaluation remains gated until DOS2's scene
-render targets are safely decoupled from the swap-chain resolution.
+DLAA and Quality are validated at 3440x1440. Quality renders at 2293x960 and
+upscales to 3440x1440. Balanced and Performance use the dimensions returned by
+NGX and share the same dynamic-resolution path, but still need broader scene
+testing. Temporal jitter and object/skinned motion vectors are the next quality
+milestone; the current build supplies camera motion reconstructed from depth.
 
 Target game build: `3.6.117.3735`.

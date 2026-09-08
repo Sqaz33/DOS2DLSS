@@ -94,6 +94,7 @@ if (Test-Path -LiteralPath $bridgeConfig) {
     $text = Get-Content -LiteralPath $bridgeConfig -Raw
     $text = $text -replace '(?m)^synth\s*=.*$', 'synth=0'
     $text = $text -replace '(?m)^source\s*=.*$', 'source=auto'
+    $text = $text -replace '(?m)^skip_game\s*=.*$', 'skip_game=0'
     Set-Content -LiteralPath $bridgeConfig -Value $text -Encoding utf8NoBOM
 }
 

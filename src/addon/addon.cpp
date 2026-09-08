@@ -20,7 +20,7 @@
 #include "reshade_api.hpp"
 #include "reshade_events.hpp"
 
-extern "C" __declspec(dllexport) const char *NAME = "DOS2 DLSS 0.3.0";
+extern "C" __declspec(dllexport) const char *NAME = "DOS2 DLSS 0.4.0";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Controls and diagnostics for the native Divinity: Original Sin 2 DLSS integration.";
 
@@ -43,6 +43,7 @@ wchar_t g_shader_dir[MAX_PATH] = {};
 wchar_t g_ngx_path[MAX_PATH] = {};
 dos2dlss::NgxRuntime g_ngx;
 dos2dlss::FramePipeline g_frame_pipeline;
+ID3D11Buffer *g_scaled_viewport_constants = nullptr;
 volatile LONG64 g_frame_draws = 0;
 volatile LONG64 g_frame_indexed_draws = 0;
 volatile LONG64 g_frame_target_binds = 0;
@@ -50,8 +51,12 @@ volatile LONG g_frame_scene_w = 0;
 volatile LONG g_frame_scene_h = 0;
 volatile LONG g_frame_color_format = 0;
 volatile LONG g_frame_depth_format = 0;
+volatile LONG64 g_native_ui_resource = 0;
 bool g_diagnostics = true;
 constexpr std::uint64_t kCombineUiPixelShader = 0x7D52DF001176EB8Dull;
+constexpr std::uint64_t kNativeUiAllocationSite = 0x1EE8A2Eull;
+thread_local int g_current_screen_level = -1;
+thread_local bool g_current_native_ui_target = false;
 std::uintptr_t g_exe_base = 0;
 std::uintptr_t g_exe_end = 0;
 
@@ -90,7 +95,9 @@ struct CapturedPass
     std::uint64_t last_pixel_shader = 0;
     CapturedTarget pixel_inputs[16] = {};
     std::uint64_t pixel_constant_buffers[16] = {};
-    std::array<std::uint8_t, 224> per_view = {};
+    std::array<std::uint8_t, 128> vertex_constants = {};
+    bool vertex_constants_valid = false;
+    std::array<std::uint8_t, 240> per_view = {};
     bool per_view_valid = false;
 };
 
@@ -131,6 +138,7 @@ std::unordered_map<std::uint64_t, BufferSnapshot> g_buffer_snapshots;
 thread_local std::uint64_t g_bound_vertex_shader = 0;
 thread_local std::uint64_t g_bound_pixel_shader = 0;
 thread_local reshade::api::resource_view g_bound_pixel_inputs[16] = {};
+thread_local reshade::api::buffer_range g_bound_vertex_constant_buffers[16] = {};
 thread_local reshade::api::buffer_range g_bound_pixel_constant_buffers[16] = {};
 thread_local MappedBuffer g_mapped_buffer = {};
 
@@ -229,6 +237,9 @@ void on_init_resource(reshade::api::device *, const reshade::api::resource_desc 
 
 void on_destroy_resource(reshade::api::device *, reshade::api::resource resource)
 {
+    if (static_cast<std::uint64_t>(InterlockedCompareExchange64(
+            &g_native_ui_resource, 0, 0)) == resource.handle)
+        InterlockedExchange64(&g_native_ui_resource, 0);
     AcquireSRWLockExclusive(&g_pipeline_lock);
     g_resource_callsites.erase(resource.handle);
     ReleaseSRWLockExclusive(&g_pipeline_lock);
@@ -254,6 +265,20 @@ void record_bound_state(reshade::api::command_list *cmd)
             pass.pixel_inputs[i] = describe_target(
                 device, device->get_resource_from_view(g_bound_pixel_inputs[i]));
         pass.pixel_constant_buffers[i] = g_bound_pixel_constant_buffers[i].buffer.handle;
+    }
+    const auto &vertex_constants = g_bound_vertex_constant_buffers[0];
+    if (vertex_constants.buffer.handle != 0 && vertex_constants.offset == 0)
+    {
+        AcquireSRWLockShared(&g_pipeline_lock);
+        const auto entry = g_buffer_snapshots.find(vertex_constants.buffer.handle);
+        if (entry != g_buffer_snapshots.end() &&
+            entry->second.size >= pass.vertex_constants.size())
+        {
+            std::memcpy(pass.vertex_constants.data(), entry->second.bytes.data(),
+                        pass.vertex_constants.size());
+            pass.vertex_constants_valid = true;
+        }
+        ReleaseSRWLockShared(&g_pipeline_lock);
     }
     const auto &per_view = g_bound_pixel_constant_buffers[12];
     if (per_view.buffer.handle != 0 && per_view.offset == 0)
@@ -410,6 +435,11 @@ void on_init_device(reshade::api::device *device)
 
 void on_destroy_device(reshade::api::device *)
 {
+    if (g_scaled_viewport_constants != nullptr)
+    {
+        g_scaled_viewport_constants->Release();
+        g_scaled_viewport_constants = nullptr;
+    }
     g_frame_pipeline.shutdown();
     g_ngx.shutdown(g_mapping.get(), &log_message);
 }
@@ -429,12 +459,160 @@ void on_init_swapchain(reshade::api::swapchain *swapchain, bool)
     }
 }
 
-void evaluate_native_dlaa(reshade::api::command_list *cmd)
+int screen_level(std::uint32_t width, std::uint32_t height,
+                 std::uint32_t output_width, std::uint32_t output_height)
+{
+    for (int level = 0; level <= 6; ++level)
+    {
+        if (width == (output_width >> level) && height == (output_height >> level))
+            return level;
+    }
+    return -1;
+}
+
+bool is_fullscreen_vertex_shader(std::uint64_t shader)
+{
+    switch (shader)
+    {
+    case 0x733270527D136859ull:
+    case 0x7C28E4C7E62FE80Bull:
+    case 0x824764AD6D95C632ull:
+    case 0x8C01621FFC817F71ull:
+    case 0xA324AB6FE694FE02ull:
+    case 0xB22F95DD13AA995Aull:
+    case 0xD0938263903A6857ull:
+    case 0xE23AC6CD78CD13BCull:
+    case 0xFC1811A3281055CAull:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void bind_viewport_uv_constants(ID3D11DeviceContext *context, bool scaled,
+                                bool force_identity, float scale_x, float scale_y)
+{
+    const auto &range = g_bound_vertex_constant_buffers[0];
+    if (context == nullptr || range.buffer.handle == 0 || range.offset != 0)
+        return;
+
+    auto *original = reinterpret_cast<ID3D11Buffer *>(range.buffer.handle);
+    context->VSSetConstantBuffers(0, 1, &original);
+    if (!scaled && !force_identity)
+        return;
+
+    BufferSnapshot snapshot;
+    bool found = false;
+    AcquireSRWLockShared(&g_pipeline_lock);
+    const auto entry = g_buffer_snapshots.find(range.buffer.handle);
+    if (entry != g_buffer_snapshots.end() && entry->second.size >= sizeof(float) * 4)
+    {
+        snapshot = entry->second;
+        found = true;
+    }
+    ReleaseSRWLockShared(&g_pipeline_lock);
+    if (!found)
+        return;
+
+    if (g_scaled_viewport_constants == nullptr)
+    {
+        ID3D11Device *device = nullptr;
+        context->GetDevice(&device);
+        if (device == nullptr)
+            return;
+        D3D11_BUFFER_DESC desc = {};
+        desc.ByteWidth = static_cast<UINT>(snapshot.bytes.size());
+        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        const HRESULT result = device->CreateBuffer(&desc, nullptr, &g_scaled_viewport_constants);
+        device->Release();
+        if (FAILED(result))
+        {
+            log_line("Viewport UV constant buffer creation failed: 0x%08lX.", result);
+            return;
+        }
+    }
+
+    auto *values = reinterpret_cast<float *>(snapshot.bytes.data());
+    if (force_identity)
+    {
+        values[0] = 1.0f;
+        values[1] = 1.0f;
+        values[2] = 0.0f;
+        values[3] = 0.0f;
+    }
+    else
+    {
+        values[0] *= scale_x;
+        values[1] *= scale_y;
+        values[2] *= scale_x;
+        values[3] *= scale_y;
+    }
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(context->Map(g_scaled_viewport_constants, 0, D3D11_MAP_WRITE_DISCARD,
+                            0, &mapped)))
+        return;
+    std::memcpy(mapped.pData, snapshot.bytes.data(), snapshot.bytes.size());
+    context->Unmap(g_scaled_viewport_constants, 0);
+    context->VSSetConstantBuffers(0, 1, &g_scaled_viewport_constants);
+}
+
+void prepare_draw_resolution(reshade::api::command_list *cmd)
+{
+    auto *state = g_mapping.get();
+    if (cmd == nullptr || state == nullptr)
+        return;
+    const LONG mode = InterlockedCompareExchange(&state->quality_mode, 0, 0);
+    if (mode < static_cast<LONG>(dos2dlss::QualityMode::quality))
+        return;
+
+    const LONG render_width = InterlockedCompareExchange(&state->render_width, 0, 0);
+    const LONG render_height = InterlockedCompareExchange(&state->render_height, 0, 0);
+    const LONG output_width = InterlockedCompareExchange(&state->backbuffer_width, 0, 0);
+    const LONG output_height = InterlockedCompareExchange(&state->backbuffer_height, 0, 0);
+    if (render_width <= 0 || render_height <= 0 || output_width <= 0 || output_height <= 0 ||
+        render_width >= output_width || render_height >= output_height)
+        return;
+
+    auto *context = reinterpret_cast<ID3D11DeviceContext *>(cmd->get_native());
+    if (context == nullptr)
+        return;
+    const bool fullscreen = is_fullscreen_vertex_shader(g_bound_vertex_shader);
+    // The final combine samples our already full-resolution DLSS output and
+    // the native UI. Scaling its shared interpolator would zoom both inputs.
+    const bool scale_uv = fullscreen && !g_current_native_ui_target &&
+                          g_bound_pixel_shader != kCombineUiPixelShader;
+    bind_viewport_uv_constants(context, scale_uv,
+        fullscreen && g_bound_pixel_shader == kCombineUiPixelShader,
+        static_cast<float>(render_width) / static_cast<float>(output_width),
+        static_cast<float>(render_height) / static_cast<float>(output_height));
+    if (g_current_screen_level < 0 && !g_current_native_ui_target)
+        return;
+    const bool scale_scene = !g_current_native_ui_target &&
+                             g_bound_pixel_shader != kCombineUiPixelShader;
+    const LONG native_width = g_current_screen_level >= 0
+        ? output_width >> g_current_screen_level : output_width;
+    const LONG native_height = g_current_screen_level >= 0
+        ? output_height >> g_current_screen_level : output_height;
+    const LONG desired_width = scale_scene
+        ? (std::max)(1L, render_width >> g_current_screen_level) : native_width;
+    const LONG desired_height = scale_scene
+        ? (std::max)(1L, render_height >> g_current_screen_level) : native_height;
+    const float width = static_cast<float>(desired_width);
+    const float height = static_cast<float>(desired_height);
+    const D3D11_VIEWPORT viewport = { 0.0f, 0.0f, width, height, 0.0f, 1.0f };
+    const D3D11_RECT scissor = { 0, 0, static_cast<LONG>(width), static_cast<LONG>(height) };
+    context->RSSetViewports(1, &viewport);
+    context->RSSetScissorRects(1, &scissor);
+}
+
+void evaluate_native_dlss(reshade::api::command_list *cmd)
 {
     auto *state = g_mapping.get();
     if (cmd == nullptr || state == nullptr || g_bound_pixel_shader != kCombineUiPixelShader ||
-        InterlockedCompareExchange(&state->quality_mode, 0, 0) !=
-            static_cast<LONG>(dos2dlss::QualityMode::dlaa) ||
+        InterlockedCompareExchange(&state->quality_mode, 0, 0) <=
+            static_cast<LONG>(dos2dlss::QualityMode::off) ||
         InterlockedCompareExchange(&state->ngx_feature_created, 0, 0) == 0)
         return;
 
@@ -455,6 +633,20 @@ void evaluate_native_dlaa(reshade::api::command_list *cmd)
     auto *context = reinterpret_cast<ID3D11DeviceContext *>(cmd->get_native());
     if (context == nullptr)
         return;
+    ID3D11ShaderResourceView *ui_view = nullptr;
+    context->PSGetShaderResources(1, 1, &ui_view);
+    if (ui_view != nullptr)
+    {
+        ID3D11Resource *ui_resource = nullptr;
+        ui_view->GetResource(&ui_resource);
+        ui_view->Release();
+        if (ui_resource != nullptr)
+        {
+            InterlockedExchange64(&g_native_ui_resource,
+                                  reinterpret_cast<LONG64>(ui_resource));
+            ui_resource->Release();
+        }
+    }
     ID3D11ShaderResourceView *input_view = nullptr;
     context->PSGetShaderResources(0, 1, &input_view);
     if (input_view == nullptr)
@@ -465,11 +657,14 @@ void evaluate_native_dlaa(reshade::api::command_list *cmd)
     if (input_color == nullptr)
         return;
 
-    const auto width = static_cast<std::uint32_t>(state->backbuffer_width);
-    const auto height = static_cast<std::uint32_t>(state->backbuffer_height);
+    const auto render_width = static_cast<std::uint32_t>(state->render_width);
+    const auto render_height = static_cast<std::uint32_t>(state->render_height);
+    const auto output_width = static_cast<std::uint32_t>(state->backbuffer_width);
+    const auto output_height = static_cast<std::uint32_t>(state->backbuffer_height);
     const bool reset = InterlockedExchange(&state->reset_requested, 0) != 0;
     ID3D11ShaderResourceView *output_view = g_frame_pipeline.evaluate(
-        context, input_color, current_view_projection, width, height,
+        context, input_color, current_view_projection, render_width, render_height,
+        output_width, output_height,
         reset, g_ngx, state, &log_message);
     input_color->Release();
     if (output_view != nullptr)
@@ -482,7 +677,8 @@ void evaluate_native_dlaa(reshade::api::command_list *cmd)
 bool on_draw(reshade::api::command_list *cmd, std::uint32_t, std::uint32_t,
              std::uint32_t, std::uint32_t)
 {
-    evaluate_native_dlaa(cmd);
+    prepare_draw_resolution(cmd);
+    evaluate_native_dlss(cmd);
     if (g_diagnostics)
         InterlockedIncrement64(&g_frame_draws);
     if (g_capture_active && g_current_captured_pass >= 0)
@@ -496,7 +692,8 @@ bool on_draw(reshade::api::command_list *cmd, std::uint32_t, std::uint32_t,
 bool on_draw_indexed(reshade::api::command_list *cmd, std::uint32_t, std::uint32_t,
                      std::uint32_t, std::int32_t, std::uint32_t)
 {
-    evaluate_native_dlaa(cmd);
+    prepare_draw_resolution(cmd);
+    evaluate_native_dlss(cmd);
     if (g_diagnostics)
         InterlockedIncrement64(&g_frame_indexed_draws);
     if (g_capture_active && g_current_captured_pass >= 0)
@@ -510,7 +707,48 @@ bool on_draw_indexed(reshade::api::command_list *cmd, std::uint32_t, std::uint32
 void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
                      const reshade::api::resource_view *rtvs, reshade::api::resource_view dsv)
 {
-    if (!g_diagnostics || cmd == nullptr)
+    if (cmd == nullptr)
+        return;
+    g_current_screen_level = -1;
+    g_current_native_ui_target = false;
+    auto *bound_device = cmd->get_device();
+    const auto *state = g_mapping.get();
+    const auto output_width = state != nullptr ? static_cast<std::uint32_t>(
+        InterlockedCompareExchange(&g_mapping.get()->backbuffer_width, 0, 0)) : 0;
+    const auto output_height = state != nullptr ? static_cast<std::uint32_t>(
+        InterlockedCompareExchange(&g_mapping.get()->backbuffer_height, 0, 0)) : 0;
+    if (bound_device != nullptr && output_width != 0 && output_height != 0)
+    {
+        reshade::api::resource first_resource = {};
+        if (count != 0 && rtvs != nullptr && rtvs[0].handle != 0)
+            first_resource = bound_device->get_resource_from_view(rtvs[0]);
+        if (first_resource.handle != 0)
+        {
+            const auto desc = bound_device->get_resource_desc(first_resource);
+            g_current_screen_level = screen_level(desc.texture.width, desc.texture.height,
+                                                  output_width, output_height);
+            AcquireSRWLockShared(&g_pipeline_lock);
+            const auto origin = g_resource_callsites.find(first_resource.handle);
+            if (origin != g_resource_callsites.end())
+                g_current_native_ui_target =
+                    origin->second[3] == kNativeUiAllocationSite;
+            ReleaseSRWLockShared(&g_pipeline_lock);
+            if (first_resource.handle == static_cast<std::uint64_t>(
+                    InterlockedCompareExchange64(&g_native_ui_resource, 0, 0)))
+                g_current_native_ui_target = true;
+        }
+        else if (dsv.handle != 0)
+        {
+            const auto depth_resource = bound_device->get_resource_from_view(dsv);
+            if (depth_resource.handle != 0)
+            {
+                const auto desc = bound_device->get_resource_desc(depth_resource);
+                g_current_screen_level = screen_level(desc.texture.width, desc.texture.height,
+                                                      output_width, output_height);
+            }
+        }
+    }
+    if (!g_diagnostics)
         return;
     InterlockedIncrement64(&g_frame_target_binds);
 
@@ -661,11 +899,14 @@ void on_push_descriptors(reshade::api::command_list *, reshade::api::shader_stag
                          const reshade::api::descriptor_table_update &update)
 {
     const auto stage_bits = static_cast<std::uint32_t>(stages);
-    if ((stage_bits & static_cast<std::uint32_t>(reshade::api::shader_stage::pixel)) == 0 ||
-        update.descriptors == nullptr || update.binding >= 16)
+    const bool vertex = (stage_bits & static_cast<std::uint32_t>(
+        reshade::api::shader_stage::vertex)) != 0;
+    const bool pixel = (stage_bits & static_cast<std::uint32_t>(
+        reshade::api::shader_stage::pixel)) != 0;
+    if ((!vertex && !pixel) || update.descriptors == nullptr || update.binding >= 16)
         return;
     const std::uint32_t count = (std::min)(update.count, 16u - update.binding);
-    if (update.type == reshade::api::descriptor_type::shader_resource_view)
+    if (pixel && update.type == reshade::api::descriptor_type::shader_resource_view)
     {
         const auto *views = static_cast<const reshade::api::resource_view *>(update.descriptors);
         for (std::uint32_t i = 0; i < count; ++i)
@@ -676,7 +917,18 @@ void on_push_descriptors(reshade::api::command_list *, reshade::api::shader_stag
     {
         const auto *buffers = static_cast<const reshade::api::buffer_range *>(update.descriptors);
         for (std::uint32_t i = 0; i < count; ++i)
-            g_bound_pixel_constant_buffers[update.binding + i] = buffers[i];
+        {
+            // Calls made through the D3D11 context can be reflected back as
+            // ReShade events. Do not mistake our temporary override for the
+            // constant buffer the game intends to bind on later draws.
+            const bool internal_viewport_buffer = g_scaled_viewport_constants != nullptr &&
+                buffers[i].buffer.handle == reinterpret_cast<std::uint64_t>(
+                    g_scaled_viewport_constants);
+            if (vertex && !internal_viewport_buffer)
+                g_bound_vertex_constant_buffers[update.binding + i] = buffers[i];
+            if (pixel)
+                g_bound_pixel_constant_buffers[update.binding + i] = buffers[i];
+        }
     }
 }
 
@@ -741,6 +993,25 @@ void write_captured_frame(LONG64 frame_number)
         if (pass.per_view_valid)
             fprintf(file, " pv=%016llX", static_cast<unsigned long long>(
                 hash_shader(pass.per_view.data(), pass.per_view.size())));
+        if (pass.vertex_constants_valid)
+            fprintf(file, " vc=%016llX", static_cast<unsigned long long>(
+                hash_shader(pass.vertex_constants.data(), pass.vertex_constants.size())));
+        fputc('\n', file);
+    }
+    std::unordered_set<std::uint64_t> written_vertex_constants;
+    for (std::uint32_t index = 0; index < g_captured_pass_count; ++index)
+    {
+        const auto &pass = g_captured_passes[index];
+        if (!pass.vertex_constants_valid)
+            continue;
+        const auto hash = hash_shader(pass.vertex_constants.data(),
+                                      pass.vertex_constants.size());
+        if (!written_vertex_constants.insert(hash).second)
+            continue;
+        const auto *values = reinterpret_cast<const float *>(pass.vertex_constants.data());
+        fprintf(file, "vertex_constants=%016llX", static_cast<unsigned long long>(hash));
+        for (std::size_t i = 0; i < pass.vertex_constants.size() / sizeof(float); ++i)
+            fprintf(file, " %.9g", values[i]);
         fputc('\n', file);
     }
     std::unordered_set<std::uint64_t> written_per_views;
@@ -825,7 +1096,7 @@ void on_present(reshade::api::command_queue *queue, reshade::api::swapchain *,
     {
         auto *context = reinterpret_cast<ID3D11DeviceContext *>(queue->get_native());
         const int mode = static_cast<int>(InterlockedCompareExchange(&state->quality_mode, 0, 0));
-        if (mode != static_cast<int>(dos2dlss::QualityMode::dlaa))
+        if (mode == static_cast<int>(dos2dlss::QualityMode::off))
         {
             g_frame_pipeline.reset_history();
             InterlockedExchange(&state->native_dlss_active, 0);
@@ -983,7 +1254,7 @@ void draw_panel(reshade::api::effect_runtime *)
     panel_line("NGX results: init 0x%08lX, capability 0x%08lX, feature 0x%08lX",
                state->ngx_init_result, state->ngx_capability_result, state->ngx_feature_result);
     panel_line("Native evaluation: %s; camera motion: %s; result 0x%08lX; frames %lld",
-               state->native_dlss_active ? "active (DLAA)" : "waiting",
+               state->native_dlss_active ? mode_name(mode) : "waiting",
                state->camera_motion_ready ? "ready" : "waiting",
                state->ngx_evaluate_result, state->ngx_evaluated_frames);
     panel_line("Back buffer: %ld x %ld", state->backbuffer_width, state->backbuffer_height);
@@ -1085,7 +1356,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         }
         InterlockedExchange(&state->addon_ready, 1);
         update_status(L"ReShade probe panel registered.");
-        log_line("DOS2 DLSS 0.3.0 registered with ReShade.");
+        log_line("DOS2 DLSS 0.4.0 registered with ReShade.");
     }
     else if (reason == DLL_PROCESS_DETACH && reserved == nullptr)
     {

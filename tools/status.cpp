@@ -2,12 +2,15 @@
 
 #include <windows.h>
 #include <cstdio>
+#include <cstdlib>
 
 int wmain(int argc, wchar_t **argv)
 {
     const bool request_capture = argc == 2 && _wcsicmp(argv[1], L"--capture") == 0;
     const bool request_screenshot = argc == 2 && _wcsicmp(argv[1], L"--screenshot") == 0;
-    const DWORD access = (request_capture || request_screenshot) ? FILE_MAP_ALL_ACCESS : FILE_MAP_READ;
+    const bool set_mode = argc == 3 && _wcsicmp(argv[1], L"--mode") == 0;
+    const DWORD access = (request_capture || request_screenshot || set_mode)
+        ? FILE_MAP_ALL_ACCESS : FILE_MAP_READ;
     HANDLE mapping = OpenFileMappingW(access, FALSE, dos2dlss::kSharedMappingName);
     if (mapping == nullptr)
     {
@@ -34,6 +37,20 @@ int wmain(int argc, wchar_t **argv)
         InterlockedExchange(&state->screenshot_complete, 0);
         InterlockedExchange(&state->screenshot_requested, 1);
         wprintf(L"ReShade screenshot requested.\n");
+    }
+    if (set_mode)
+    {
+        const long mode = wcstol(argv[2], nullptr, 10);
+        if (mode < 0 || mode > 4)
+        {
+            fwprintf(stderr, L"Mode must be 0 (Off), 1 (DLAA), 2 (Quality), 3 (Balanced), or 4 (Performance).\n");
+            UnmapViewOfFile(state);
+            CloseHandle(mapping);
+            return 3;
+        }
+        InterlockedExchange(&state->quality_mode, mode);
+        InterlockedExchange(&state->reset_requested, 1);
+        wprintf(L"Mode changed to %ld.\n", mode);
     }
 
     wprintf(L"native_ready=%ld\n", state->native_ready);

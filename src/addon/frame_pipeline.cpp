@@ -192,24 +192,31 @@ bool FramePipeline::create_depth_view(LogFn log)
     return true;
 }
 
-bool FramePipeline::ensure_resources(std::uint32_t width, std::uint32_t height, LogFn log)
+bool FramePipeline::ensure_resources(std::uint32_t render_width,
+                                     std::uint32_t render_height,
+                                     std::uint32_t output_width,
+                                     std::uint32_t output_height, LogFn log)
 {
-    if (width_ == width && height_ == height && motion_texture_ != nullptr &&
-        output_texture_ != nullptr && create_depth_view(log))
+    if (render_width_ == render_width && render_height_ == render_height &&
+        output_width_ == output_width && output_height_ == output_height &&
+        motion_texture_ != nullptr && output_texture_ != nullptr && create_depth_view(log))
         return true;
     release(motion_uav_);
     release(motion_texture_);
     release(output_view_);
     release(output_texture_);
-    width_ = 0;
-    height_ = 0;
+    render_width_ = 0;
+    render_height_ = 0;
+    output_width_ = 0;
+    output_height_ = 0;
     has_previous_camera_ = false;
-    if (device_ == nullptr || width == 0 || height == 0 || !create_depth_view(log))
+    if (device_ == nullptr || render_width == 0 || render_height == 0 ||
+        output_width == 0 || output_height == 0 || !create_depth_view(log))
         return false;
 
     D3D11_TEXTURE2D_DESC motion = {};
-    motion.Width = width;
-    motion.Height = height;
+    motion.Width = render_width;
+    motion.Height = render_height;
     motion.MipLevels = 1;
     motion.ArraySize = 1;
     motion.Format = DXGI_FORMAT_R16G16_FLOAT;
@@ -228,6 +235,8 @@ bool FramePipeline::ensure_resources(std::uint32_t width, std::uint32_t height, 
     }
 
     D3D11_TEXTURE2D_DESC output = motion;
+    output.Width = output_width;
+    output.Height = output_height;
     output.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     ID3D11Texture2D *output_texture = nullptr;
     result = device_->CreateTexture2D(&output, nullptr, &output_texture);
@@ -239,20 +248,24 @@ bool FramePipeline::ensure_resources(std::uint32_t width, std::uint32_t height, 
         write_log(log, "DLSS output texture creation failed: 0x%08lX.", result);
         return false;
     }
-    width_ = width;
-    height_ = height;
-    write_log(log, "DLAA frame resources created: %ux%u.", width, height);
+    render_width_ = render_width;
+    render_height_ = render_height;
+    output_width_ = output_width;
+    output_height_ = output_height;
+    write_log(log, "DLSS frame resources created: %ux%u -> %ux%u.",
+              render_width, render_height, output_width, output_height);
     return true;
 }
 
 ID3D11ShaderResourceView *FramePipeline::evaluate(
     ID3D11DeviceContext *context, ID3D11Resource *color,
-    const float current_view_projection[16], std::uint32_t width,
-    std::uint32_t height, bool reset, NgxRuntime &ngx,
+    const float current_view_projection[16], std::uint32_t render_width,
+    std::uint32_t render_height, std::uint32_t output_width,
+    std::uint32_t output_height, bool reset, NgxRuntime &ngx,
     SharedState *state, LogFn log)
 {
     if (context == nullptr || color == nullptr || current_view_projection == nullptr ||
-        !ensure_resources(width, height, log))
+        !ensure_resources(render_width, render_height, output_width, output_height, log))
         return nullptr;
 
     using namespace DirectX;
@@ -283,8 +296,8 @@ ID3D11ShaderResourceView *FramePipeline::evaluate(
     XMStoreFloat4x4(&constants.current_inverse_view_projection, inverse);
     std::memcpy(&constants.previous_view_projection, previous_view_projection_,
                 sizeof(previous_view_projection_));
-    constants.render_size[0] = static_cast<float>(width);
-    constants.render_size[1] = static_cast<float>(height);
+    constants.render_size[0] = static_cast<float>(render_width);
+    constants.render_size[1] = static_cast<float>(render_height);
 
     ID3D11ComputeShader *old_shader = nullptr;
     ID3D11Buffer *old_constants = nullptr;
@@ -300,7 +313,7 @@ ID3D11ShaderResourceView *FramePipeline::evaluate(
     context->CSSetConstantBuffers(0, 1, &motion_constants_);
     context->CSSetShaderResources(0, 1, &depth_view_);
     context->CSSetUnorderedAccessViews(0, 1, &motion_uav_, nullptr);
-    context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+    context->Dispatch((render_width + 7) / 8, (render_height + 7) / 8, 1);
 
     ID3D11UnorderedAccessView *no_uav = nullptr;
     ID3D11ShaderResourceView *no_srv = nullptr;
@@ -318,7 +331,8 @@ ID3D11ShaderResourceView *FramePipeline::evaluate(
 
     InterlockedExchange(&state->camera_motion_ready, 1);
     const bool succeeded = ngx.evaluate(context, color, output_texture_, scene_depth_,
-                                        motion_texture_, width, height, reset, state, log);
+                                        motion_texture_, render_width, render_height,
+                                        reset, state, log);
     std::memcpy(previous_view_projection_, current_view_projection,
                 sizeof(previous_view_projection_));
     has_previous_camera_ = true;
@@ -336,8 +350,10 @@ void FramePipeline::shutdown()
     release(motion_constants_);
     release(motion_shader_);
     release(device_);
-    width_ = 0;
-    height_ = 0;
+    render_width_ = 0;
+    render_height_ = 0;
+    output_width_ = 0;
+    output_height_ = 0;
     has_previous_camera_ = false;
 }
 }
