@@ -270,6 +270,13 @@ struct PanelImGui
     bool (*RadioButton2)(const char *, int *, int);
 };
 
+static_assert(offsetof(PanelImGui, GetVersion) == (kOrdGetVersion - 1) * sizeof(void *));
+static_assert(offsetof(PanelImGui, SameLine) == (kOrdSameLine - 1) * sizeof(void *));
+static_assert(offsetof(PanelImGui, TextUnformatted) == (kOrdTextUnformatted - 1) * sizeof(void *));
+static_assert(offsetof(PanelImGui, SeparatorText) == (kOrdSeparatorText - 1) * sizeof(void *));
+static_assert(offsetof(PanelImGui, Checkbox) == (kOrdCheckbox - 1) * sizeof(void *));
+static_assert(offsetof(PanelImGui, RadioButton2) == (kOrdRadioButton2 - 1) * sizeof(void *));
+
 const PanelImGui *g_ui = nullptr;
 
 void panel_line(const char *format, ...)
@@ -361,11 +368,16 @@ bool register_callbacks()
     reg(reshade::addon_event::bind_render_targets_and_depth_stencil, reinterpret_cast<void *>(&on_bind_targets));
     reg(reshade::addon_event::present, reinterpret_cast<void *>(&on_present));
 
-    g_ui = static_cast<const PanelImGui *>(get_table(19250));
-    if (g_ui == nullptr)
-        g_ui = static_cast<const PanelImGui *>(get_table(19000));
+    // The member ordinals above describe the 19000 compatibility table.
+    // Requesting the newer 19250 table with this layout reached the wrong
+    // TextUnformatted entry and crashed as soon as the panel was opened.
+    g_ui = static_cast<const PanelImGui *>(get_table(19000));
     if (g_ui == nullptr || g_ui->GetVersion == nullptr)
         return false;
+    const char *imgui_version = g_ui->GetVersion();
+    if (imgui_version == nullptr || imgui_version[0] < '0' || imgui_version[0] > '9')
+        return false;
+    log_line("ReShade ImGui compatibility table 19000, runtime %s.", imgui_version);
     reg_overlay("DOS2 DLSS", &draw_panel);
     return true;
 }
