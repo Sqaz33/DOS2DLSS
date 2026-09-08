@@ -59,12 +59,33 @@ if (-not (Test-Path -LiteralPath (Join-Path $bin 'dos2-dlss.ini'))) {
 $renamed = @()
 foreach ($leaf in @('dlss5-feed.addon64', 'dlss5-bridge.addon64')) {
     $active = Join-Path $bin $leaf
+    $disabled = "$active.dos2dlss-disabled"
     if (Test-Path -LiteralPath $active) {
-        $disabled = "$active.dos2dlss-disabled"
         if (Test-Path -LiteralPath $disabled) { Remove-Item -LiteralPath $disabled -Force }
         Move-Item -LiteralPath $active -Destination $disabled
+    }
+    if (Test-Path -LiteralPath $disabled) {
         $renamed += [pscustomobject]@{ Active = $active; Disabled = $disabled }
     }
+}
+
+# DOS2 ships the Windows 8.1 SDK build of D3DCompiler. RenoDX's DLSS5 proxy
+# compiles a Shader Model 5.1 compute shader at runtime, which that old DLL
+# rejects with X3506. Let Windows load its current system copy instead, while
+# retaining the game-local file for a completely reversible uninstall.
+$compiler = Join-Path $bin 'd3dcompiler_47.dll'
+$compilerDisabled = "$compiler.dos2dlss-disabled"
+if (Test-Path -LiteralPath $compiler) {
+    $compilerVersion = (Get-Item -LiteralPath $compiler).VersionInfo.FileVersion
+    if ($compilerVersion -like '6.3.9600.*') {
+        if (Test-Path -LiteralPath $compilerDisabled) {
+            throw 'Both active and DOS2DLSS-disabled copies of d3dcompiler_47.dll exist.'
+        }
+        Move-Item -LiteralPath $compiler -Destination $compilerDisabled
+    }
+}
+if (Test-Path -LiteralPath $compilerDisabled) {
+    $renamed += [pscustomobject]@{ Active = $compiler; Disabled = $compilerDisabled }
 }
 
 $bridgeConfig = Join-Path $bin 'dlss5-bridge.cfg'

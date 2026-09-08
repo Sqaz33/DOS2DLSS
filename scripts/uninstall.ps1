@@ -34,6 +34,16 @@ if (Test-Path -LiteralPath $statePath) {
     }
 }
 
+# Recover files disabled by an older/repeated installation even if its state
+# file did not preserve the rename list.
+foreach ($leaf in @('dlss5-feed.addon64', 'dlss5-bridge.addon64', 'd3dcompiler_47.dll')) {
+    $active = Join-Path $bin $leaf
+    $disabled = "$active.dos2dlss-disabled"
+    if ((-not (Test-Path -LiteralPath $active)) -and (Test-Path -LiteralPath $disabled)) {
+        Move-Item -LiteralPath $disabled -Destination $active
+    }
+}
+
 $bridgeBackup = Join-Path $backup 'dlss5-bridge.cfg'
 if (Test-Path -LiteralPath $bridgeBackup) {
     Copy-Item -LiteralPath $bridgeBackup -Destination (Join-Path $bin 'dlss5-bridge.cfg') -Force
@@ -46,4 +56,3 @@ foreach ($leaf in @('settings.json', 'addon_deployments.json')) {
 }
 
 Write-Host 'DOS2DLSS removed and the previous game/RHI state restored.'
-
