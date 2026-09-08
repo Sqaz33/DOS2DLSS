@@ -743,6 +743,14 @@ void prepare_draw_resolution(reshade::api::command_list *cmd)
     if (context == nullptr)
         return;
 
+    // Scaleform uses per-widget viewports and scissor rectangles, including
+    // the minimap. The target texture size is not the widget viewport size.
+    if (g_current_native_ui_target)
+    {
+        restore_camera_constants(context);
+        return;
+    }
+
     // DLAA keeps the native render dimensions, but still needs the same
     // sub-pixel sample position that is supplied to NGX. Restrict the shifted
     // viewport to the G-buffer pass so UI, shadow maps and screen-space passes
@@ -906,9 +914,37 @@ void evaluate_native_dlss(reshade::api::command_list *cmd)
     }
 }
 
-bool on_draw(reshade::api::command_list *cmd, std::uint32_t, std::uint32_t,
-             std::uint32_t, std::uint32_t)
+// All viewport overrides are local to one draw. DOS2 caches raster state;
+// leaving an override bound stretches later UI even if its target is known.
+thread_local bool g_submitting_draw = false;
+struct DrawRasterScope
 {
+    ID3D11DeviceContext *context;
+    UINT viewport_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    UINT scissor_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+    D3D11_RECT scissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+    explicit DrawRasterScope(reshade::api::command_list *cmd)
+        : context(reinterpret_cast<ID3D11DeviceContext *>(cmd->get_native()))
+    {
+        context->RSGetViewports(&viewport_count, viewports);
+        context->RSGetScissorRects(&scissor_count, scissors);
+        g_submitting_draw = true;
+    }
+    ~DrawRasterScope()
+    {
+        context->RSSetViewports(viewport_count, viewports);
+        context->RSSetScissorRects(scissor_count, scissors);
+        g_submitting_draw = false;
+    }
+};
+
+bool on_draw(reshade::api::command_list *cmd, std::uint32_t vertices,
+             std::uint32_t instances, std::uint32_t first_vertex, std::uint32_t first_instance)
+{
+    if (g_submitting_draw)
+        return false;
+    DrawRasterScope raster(cmd);
     prepare_draw_resolution(cmd);
     evaluate_native_dlss(cmd);
     if (g_diagnostics)
@@ -918,12 +954,17 @@ bool on_draw(reshade::api::command_list *cmd, std::uint32_t, std::uint32_t,
         ++g_captured_passes[g_current_captured_pass].draws;
         record_bound_state(cmd);
     }
-    return false;
+    raster.context->DrawInstanced(vertices, instances, first_vertex, first_instance);
+    return true;
 }
 
-bool on_draw_indexed(reshade::api::command_list *cmd, std::uint32_t, std::uint32_t,
-                     std::uint32_t, std::int32_t, std::uint32_t)
+bool on_draw_indexed(reshade::api::command_list *cmd, std::uint32_t indices,
+                     std::uint32_t instances, std::uint32_t first_index,
+                     std::int32_t vertex_offset, std::uint32_t first_instance)
 {
+    if (g_submitting_draw)
+        return false;
+    DrawRasterScope raster(cmd);
     prepare_draw_resolution(cmd);
     evaluate_native_dlss(cmd);
     if (g_diagnostics)
@@ -933,7 +974,8 @@ bool on_draw_indexed(reshade::api::command_list *cmd, std::uint32_t, std::uint32
         ++g_captured_passes[g_current_captured_pass].indexed_draws;
         record_bound_state(cmd);
     }
-    return false;
+    raster.context->DrawIndexedInstanced(indices, instances, first_index, vertex_offset, first_instance);
+    return true;
 }
 
 void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
