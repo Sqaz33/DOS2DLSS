@@ -11,6 +11,8 @@
 #include <cstring>
 #include <iterator>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "reshade_api.hpp"
 #include "reshade_events.hpp"
@@ -34,6 +36,7 @@ dos2dlss::SharedMapping g_mapping;
 wchar_t g_config_path[MAX_PATH] = {};
 wchar_t g_log_path[MAX_PATH] = {};
 wchar_t g_trace_path[MAX_PATH] = {};
+wchar_t g_shader_dir[MAX_PATH] = {};
 wchar_t g_ngx_path[MAX_PATH] = {};
 dos2dlss::NgxRuntime g_ngx;
 volatile LONG64 g_frame_draws = 0;
@@ -73,12 +76,19 @@ struct PipelineShaders
     std::uint64_t pixel = 0;
 };
 
+struct ShaderBlob
+{
+    std::vector<std::uint8_t> bytes;
+    bool pixel = false;
+};
+
 CapturedPass g_captured_passes[256] = {};
 std::uint32_t g_captured_pass_count = 0;
 std::int32_t g_current_captured_pass = -1;
 bool g_capture_active = false;
 SRWLOCK g_pipeline_lock = SRWLOCK_INIT;
 std::unordered_map<std::uint64_t, PipelineShaders> g_pipeline_shaders;
+std::unordered_map<std::uint64_t, ShaderBlob> g_shader_blobs;
 thread_local std::uint64_t g_bound_vertex_shader = 0;
 thread_local std::uint64_t g_bound_pixel_shader = 0;
 
@@ -356,10 +366,21 @@ void on_init_pipeline(reshade::api::device *, reshade::api::pipeline_layout,
         if (descs[0].code == nullptr || descs[0].code_size == 0)
             continue;
         const auto hash = hash_shader(descs[0].code, descs[0].code_size);
-        if (object.type == reshade::api::pipeline_subobject_type::vertex_shader)
+        const bool is_pixel = object.type == reshade::api::pipeline_subobject_type::pixel_shader;
+        if (!is_pixel)
             shaders.vertex = hash;
         else
             shaders.pixel = hash;
+        AcquireSRWLockExclusive(&g_pipeline_lock);
+        if (!g_shader_blobs.contains(hash))
+        {
+            ShaderBlob blob;
+            const auto *begin = static_cast<const std::uint8_t *>(descs[0].code);
+            blob.bytes.assign(begin, begin + descs[0].code_size);
+            blob.pixel = is_pixel;
+            g_shader_blobs.emplace(hash, std::move(blob));
+        }
+        ReleaseSRWLockExclusive(&g_pipeline_lock);
     }
     if (shaders.vertex == 0 && shaders.pixel == 0)
         return;
@@ -428,6 +449,40 @@ void write_captured_frame(LONG64 frame_number)
         fputc('\n', file);
     }
     fclose(file);
+
+    CreateDirectoryW(g_shader_dir, nullptr);
+    std::unordered_set<std::uint64_t> hashes;
+    for (std::uint32_t index = 0; index < g_captured_pass_count; ++index)
+    {
+        const auto &pass = g_captured_passes[index];
+        hashes.insert(pass.first_vertex_shader);
+        hashes.insert(pass.last_vertex_shader);
+        hashes.insert(pass.first_pixel_shader);
+        hashes.insert(pass.last_pixel_shader);
+    }
+    hashes.erase(0);
+    for (const auto hash : hashes)
+    {
+        ShaderBlob blob;
+        AcquireSRWLockShared(&g_pipeline_lock);
+        const auto entry = g_shader_blobs.find(hash);
+        if (entry != g_shader_blobs.end())
+            blob = entry->second;
+        ReleaseSRWLockShared(&g_pipeline_lock);
+        if (blob.bytes.empty())
+            continue;
+
+        wchar_t path[MAX_PATH] = {};
+        swprintf_s(path, L"%ls\\%ls-%016llX.cso", g_shader_dir,
+                   blob.pixel ? L"ps" : L"vs",
+                   static_cast<unsigned long long>(hash));
+        FILE *shader = nullptr;
+        if (_wfopen_s(&shader, path, L"wb") == 0 && shader != nullptr)
+        {
+            fwrite(blob.bytes.data(), 1, blob.bytes.size(), shader);
+            fclose(shader);
+        }
+    }
 }
 
 void on_present(reshade::api::command_queue *queue, reshade::api::swapchain *,
@@ -644,6 +699,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         make_sibling_path(module, L"dos2-dlss.ini", g_config_path);
         make_sibling_path(module, L"dos2-dlss.log", g_log_path);
         make_sibling_path(module, L"dos2-dlss-frame-trace.log", g_trace_path);
+        make_sibling_path(module, L"DOS2DLSS-Shaders", g_shader_dir);
         make_sibling_path(module, L"DOS2DLSS-NGX", g_ngx_path);
         FILE *clear = nullptr;
         if (_wfopen_s(&clear, g_log_path, L"w") == 0 && clear != nullptr) fclose(clear);
