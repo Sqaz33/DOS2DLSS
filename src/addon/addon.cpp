@@ -6,6 +6,7 @@
 #include <d3d11.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdint>
@@ -71,6 +72,8 @@ struct CapturedPass
     std::uint64_t last_pixel_shader = 0;
     CapturedTarget pixel_inputs[16] = {};
     std::uint64_t pixel_constant_buffers[16] = {};
+    std::array<std::uint8_t, 224> per_view = {};
+    bool per_view_valid = false;
 };
 
 struct PipelineShaders
@@ -85,6 +88,20 @@ struct ShaderBlob
     bool pixel = false;
 };
 
+struct BufferSnapshot
+{
+    std::array<std::uint8_t, 512> bytes = {};
+    std::size_t size = 0;
+};
+
+struct MappedBuffer
+{
+    std::uint64_t resource = 0;
+    const std::uint8_t *data = nullptr;
+    std::uint64_t offset = 0;
+    std::uint64_t size = 0;
+};
+
 CapturedPass g_captured_passes[256] = {};
 std::uint32_t g_captured_pass_count = 0;
 std::int32_t g_current_captured_pass = -1;
@@ -92,10 +109,12 @@ bool g_capture_active = false;
 SRWLOCK g_pipeline_lock = SRWLOCK_INIT;
 std::unordered_map<std::uint64_t, PipelineShaders> g_pipeline_shaders;
 std::unordered_map<std::uint64_t, ShaderBlob> g_shader_blobs;
+std::unordered_map<std::uint64_t, BufferSnapshot> g_buffer_snapshots;
 thread_local std::uint64_t g_bound_vertex_shader = 0;
 thread_local std::uint64_t g_bound_pixel_shader = 0;
 thread_local reshade::api::resource_view g_bound_pixel_inputs[16] = {};
 thread_local reshade::api::buffer_range g_bound_pixel_constant_buffers[16] = {};
+thread_local MappedBuffer g_mapped_buffer = {};
 
 std::uint64_t hash_shader(const void *data, std::size_t size)
 {
@@ -158,6 +177,65 @@ void record_bound_state(reshade::api::command_list *cmd)
                 device, device->get_resource_from_view(g_bound_pixel_inputs[i]));
         pass.pixel_constant_buffers[i] = g_bound_pixel_constant_buffers[i].buffer.handle;
     }
+    const auto &per_view = g_bound_pixel_constant_buffers[12];
+    if (per_view.buffer.handle != 0 && per_view.offset == 0)
+    {
+        AcquireSRWLockShared(&g_pipeline_lock);
+        const auto entry = g_buffer_snapshots.find(per_view.buffer.handle);
+        if (entry != g_buffer_snapshots.end() && entry->second.size >= pass.per_view.size())
+        {
+            std::memcpy(pass.per_view.data(), entry->second.bytes.data(), pass.per_view.size());
+            pass.per_view_valid = true;
+        }
+        ReleaseSRWLockShared(&g_pipeline_lock);
+    }
+}
+
+void save_buffer_snapshot(std::uint64_t resource, const void *data,
+                          std::uint64_t offset, std::uint64_t size)
+{
+    if (resource == 0 || data == nullptr || offset != 0 || size == 0)
+        return;
+    BufferSnapshot snapshot;
+    snapshot.size = static_cast<std::size_t>((std::min)(size,
+        static_cast<std::uint64_t>(snapshot.bytes.size())));
+    std::memcpy(snapshot.bytes.data(), data, snapshot.size);
+    AcquireSRWLockExclusive(&g_pipeline_lock);
+    g_buffer_snapshots[resource] = snapshot;
+    ReleaseSRWLockExclusive(&g_pipeline_lock);
+}
+
+void on_map_buffer_region(reshade::api::device *device, reshade::api::resource resource,
+                          std::uint64_t offset, std::uint64_t size,
+                          reshade::api::map_access, void **data)
+{
+    g_mapped_buffer = {};
+    if (device == nullptr || resource.handle == 0 || data == nullptr || *data == nullptr)
+        return;
+    if (size == UINT64_MAX)
+    {
+        const auto desc = device->get_resource_desc(resource);
+        if (desc.type != reshade::api::resource_type::buffer || desc.buffer.size <= offset)
+            return;
+        size = desc.buffer.size - offset;
+    }
+    g_mapped_buffer = { resource.handle, static_cast<const std::uint8_t *>(*data), offset, size };
+}
+
+void on_unmap_buffer_region(reshade::api::device *, reshade::api::resource resource)
+{
+    if (g_mapped_buffer.resource == resource.handle)
+        save_buffer_snapshot(resource.handle, g_mapped_buffer.data,
+                             g_mapped_buffer.offset, g_mapped_buffer.size);
+    g_mapped_buffer = {};
+}
+
+bool on_update_buffer_region(reshade::api::device *, const void *data,
+                             reshade::api::resource resource, std::uint64_t offset,
+                             std::uint64_t size)
+{
+    save_buffer_snapshot(resource.handle, data, offset, size);
+    return false;
 }
 
 void log_line(const char *format, ...)
@@ -498,6 +576,24 @@ void write_captured_frame(LONG64 frame_number)
             if (pass.pixel_constant_buffers[i] != 0)
                 fprintf(file, " cb%u=%llX", i,
                         static_cast<unsigned long long>(pass.pixel_constant_buffers[i]));
+        if (pass.per_view_valid)
+            fprintf(file, " pv=%016llX", static_cast<unsigned long long>(
+                hash_shader(pass.per_view.data(), pass.per_view.size())));
+        fputc('\n', file);
+    }
+    std::unordered_set<std::uint64_t> written_per_views;
+    for (std::uint32_t index = 0; index < g_captured_pass_count; ++index)
+    {
+        const auto &pass = g_captured_passes[index];
+        if (!pass.per_view_valid)
+            continue;
+        const auto hash = hash_shader(pass.per_view.data(), pass.per_view.size());
+        if (!written_per_views.insert(hash).second)
+            continue;
+        const auto *values = reinterpret_cast<const float *>(pass.per_view.data());
+        fprintf(file, "per_view=%016llX", static_cast<unsigned long long>(hash));
+        for (std::size_t i = 0; i < pass.per_view.size() / sizeof(float); ++i)
+            fprintf(file, " %.9g", values[i]);
         fputc('\n', file);
     }
     fclose(file);
@@ -719,6 +815,9 @@ bool register_callbacks()
     reg(reshade::addon_event::init_device, reinterpret_cast<void *>(&on_init_device));
     reg(reshade::addon_event::destroy_device, reinterpret_cast<void *>(&on_destroy_device));
     reg(reshade::addon_event::init_swapchain, reinterpret_cast<void *>(&on_init_swapchain));
+    reg(reshade::addon_event::map_buffer_region, reinterpret_cast<void *>(&on_map_buffer_region));
+    reg(reshade::addon_event::unmap_buffer_region, reinterpret_cast<void *>(&on_unmap_buffer_region));
+    reg(reshade::addon_event::update_buffer_region, reinterpret_cast<void *>(&on_update_buffer_region));
     reg(reshade::addon_event::init_pipeline, reinterpret_cast<void *>(&on_init_pipeline));
     reg(reshade::addon_event::destroy_pipeline, reinterpret_cast<void *>(&on_destroy_pipeline));
     reg(reshade::addon_event::bind_pipeline, reinterpret_cast<void *>(&on_bind_pipeline));
