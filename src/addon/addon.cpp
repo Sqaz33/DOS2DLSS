@@ -5,6 +5,7 @@
 #include <psapi.h>
 #include <d3d11.h>
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdint>
@@ -68,6 +69,8 @@ struct CapturedPass
     std::uint64_t last_vertex_shader = 0;
     std::uint64_t first_pixel_shader = 0;
     std::uint64_t last_pixel_shader = 0;
+    CapturedTarget pixel_inputs[16] = {};
+    std::uint64_t pixel_constant_buffers[16] = {};
 };
 
 struct PipelineShaders
@@ -91,6 +94,8 @@ std::unordered_map<std::uint64_t, PipelineShaders> g_pipeline_shaders;
 std::unordered_map<std::uint64_t, ShaderBlob> g_shader_blobs;
 thread_local std::uint64_t g_bound_vertex_shader = 0;
 thread_local std::uint64_t g_bound_pixel_shader = 0;
+thread_local reshade::api::resource_view g_bound_pixel_inputs[16] = {};
+thread_local reshade::api::buffer_range g_bound_pixel_constant_buffers[16] = {};
 
 std::uint64_t hash_shader(const void *data, std::size_t size)
 {
@@ -132,7 +137,7 @@ CapturedTarget describe_target(reshade::api::device *device, reshade::api::resou
     return target;
 }
 
-void record_bound_shaders()
+void record_bound_state(reshade::api::command_list *cmd)
 {
     if (!g_capture_active || g_current_captured_pass < 0)
         return;
@@ -143,6 +148,16 @@ void record_bound_shaders()
         pass.first_pixel_shader = g_bound_pixel_shader;
     pass.last_vertex_shader = g_bound_vertex_shader;
     pass.last_pixel_shader = g_bound_pixel_shader;
+    if (cmd == nullptr || (pass.draws + pass.indexed_draws) != 1)
+        return;
+    auto *device = cmd->get_device();
+    for (std::uint32_t i = 0; i < std::size(g_bound_pixel_inputs); ++i)
+    {
+        if (g_bound_pixel_inputs[i].handle != 0)
+            pass.pixel_inputs[i] = describe_target(
+                device, device->get_resource_from_view(g_bound_pixel_inputs[i]));
+        pass.pixel_constant_buffers[i] = g_bound_pixel_constant_buffers[i].buffer.handle;
+    }
 }
 
 void log_line(const char *format, ...)
@@ -252,7 +267,7 @@ void on_init_swapchain(reshade::api::swapchain *swapchain, bool)
     }
 }
 
-bool on_draw(reshade::api::command_list *, std::uint32_t, std::uint32_t,
+bool on_draw(reshade::api::command_list *cmd, std::uint32_t, std::uint32_t,
              std::uint32_t, std::uint32_t)
 {
     if (g_diagnostics)
@@ -260,12 +275,12 @@ bool on_draw(reshade::api::command_list *, std::uint32_t, std::uint32_t,
     if (g_capture_active && g_current_captured_pass >= 0)
     {
         ++g_captured_passes[g_current_captured_pass].draws;
-        record_bound_shaders();
+        record_bound_state(cmd);
     }
     return false;
 }
 
-bool on_draw_indexed(reshade::api::command_list *, std::uint32_t, std::uint32_t,
+bool on_draw_indexed(reshade::api::command_list *cmd, std::uint32_t, std::uint32_t,
                      std::uint32_t, std::int32_t, std::uint32_t)
 {
     if (g_diagnostics)
@@ -273,7 +288,7 @@ bool on_draw_indexed(reshade::api::command_list *, std::uint32_t, std::uint32_t,
     if (g_capture_active && g_current_captured_pass >= 0)
     {
         ++g_captured_passes[g_current_captured_pass].indexed_draws;
-        record_bound_shaders();
+        record_bound_state(cmd);
     }
     return false;
 }
@@ -413,6 +428,30 @@ void on_bind_pipeline(reshade::api::command_list *, reshade::api::pipeline_stage
         g_bound_pixel_shader = shaders.pixel;
 }
 
+void on_push_descriptors(reshade::api::command_list *, reshade::api::shader_stage stages,
+                         reshade::api::pipeline_layout, std::uint32_t,
+                         const reshade::api::descriptor_table_update &update)
+{
+    const auto stage_bits = static_cast<std::uint32_t>(stages);
+    if ((stage_bits & static_cast<std::uint32_t>(reshade::api::shader_stage::pixel)) == 0 ||
+        update.descriptors == nullptr || update.binding >= 16)
+        return;
+    const std::uint32_t count = (std::min)(update.count, 16u - update.binding);
+    if (update.type == reshade::api::descriptor_type::shader_resource_view)
+    {
+        const auto *views = static_cast<const reshade::api::resource_view *>(update.descriptors);
+        for (std::uint32_t i = 0; i < count; ++i)
+            g_bound_pixel_inputs[update.binding + i] = views[i];
+    }
+    else if (update.type == reshade::api::descriptor_type::constant_buffer ||
+             update.type == reshade::api::descriptor_type::constant_buffer_with_dynamic_offset)
+    {
+        const auto *buffers = static_cast<const reshade::api::buffer_range *>(update.descriptors);
+        for (std::uint32_t i = 0; i < count; ++i)
+            g_bound_pixel_constant_buffers[update.binding + i] = buffers[i];
+    }
+}
+
 void write_captured_frame(LONG64 frame_number)
 {
     FILE *file = nullptr;
@@ -446,6 +485,19 @@ void write_captured_frame(LONG64 frame_number)
                     static_cast<unsigned long long>(pass.last_vertex_shader),
                     static_cast<unsigned long long>(pass.first_pixel_shader),
                     static_cast<unsigned long long>(pass.last_pixel_shader));
+        for (std::uint32_t i = 0; i < std::size(pass.pixel_inputs); ++i)
+        {
+            const auto &input = pass.pixel_inputs[i];
+            if (input.resource != 0)
+                fprintf(file, " t%u=%llX:%ux%u:f%u%s%s", i,
+                        static_cast<unsigned long long>(input.resource),
+                        input.width, input.height, input.format,
+                        input.name[0] != '\0' ? ":" : "", input.name);
+        }
+        for (std::uint32_t i = 0; i < std::size(pass.pixel_constant_buffers); ++i)
+            if (pass.pixel_constant_buffers[i] != 0)
+                fprintf(file, " cb%u=%llX", i,
+                        static_cast<unsigned long long>(pass.pixel_constant_buffers[i]));
         fputc('\n', file);
     }
     fclose(file);
@@ -670,6 +722,7 @@ bool register_callbacks()
     reg(reshade::addon_event::init_pipeline, reinterpret_cast<void *>(&on_init_pipeline));
     reg(reshade::addon_event::destroy_pipeline, reinterpret_cast<void *>(&on_destroy_pipeline));
     reg(reshade::addon_event::bind_pipeline, reinterpret_cast<void *>(&on_bind_pipeline));
+    reg(reshade::addon_event::push_descriptors, reinterpret_cast<void *>(&on_push_descriptors));
     reg(reshade::addon_event::draw, reinterpret_cast<void *>(&on_draw));
     reg(reshade::addon_event::draw_indexed, reinterpret_cast<void *>(&on_draw_indexed));
     reg(reshade::addon_event::bind_render_targets_and_depth_stencil, reinterpret_cast<void *>(&on_bind_targets));
