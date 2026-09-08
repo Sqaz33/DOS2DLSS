@@ -31,9 +31,15 @@ set_target_properties(dos2_dlss_addon PROPERTIES
   SUFFIX ".addon64"
 )
 
+add_executable(dos2dlss_status
+  tools/status.cpp
+)
+target_include_directories(dos2dlss_status PRIVATE include)
+target_compile_definitions(dos2dlss_status PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+target_compile_options(dos2dlss_status PRIVATE /W4 /permissive- /EHsc)
+
 install(TARGETS DOS2DLSSNative dos2_dlss_addon
   RUNTIME DESTINATION .
   LIBRARY DESTINATION .
 )
 install(FILES config/dos2-dlss.ini DESTINATION .)
-
