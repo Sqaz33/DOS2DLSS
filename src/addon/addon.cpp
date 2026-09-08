@@ -52,10 +52,25 @@ volatile LONG g_frame_color_format = 0;
 volatile LONG g_frame_depth_format = 0;
 bool g_diagnostics = true;
 constexpr std::uint64_t kCombineUiPixelShader = 0x7D52DF001176EB8Dull;
+std::uintptr_t g_exe_base = 0;
+std::uintptr_t g_exe_end = 0;
+
+struct PendingResourceCreation
+{
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t format = 0;
+    std::array<std::uint64_t, 4> game_callsites = {};
+    bool valid = false;
+};
+
+thread_local PendingResourceCreation g_pending_resource = {};
+std::unordered_map<std::uint64_t, std::array<std::uint64_t, 4>> g_resource_callsites;
 
 struct CapturedTarget
 {
     std::uint64_t resource = 0;
+    std::array<std::uint64_t, 4> creation_sites = {};
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::uint32_t format = 0;
@@ -155,8 +170,68 @@ CapturedTarget describe_target(reshade::api::device *device, reshade::api::resou
     target.width = desc.texture.width;
     target.height = desc.texture.height;
     target.format = static_cast<std::uint32_t>(desc.texture.format);
+    AcquireSRWLockShared(&g_pipeline_lock);
+    const auto site = g_resource_callsites.find(resource.handle);
+    if (site != g_resource_callsites.end())
+        target.creation_sites = site->second;
+    ReleaseSRWLockShared(&g_pipeline_lock);
     read_debug_name(resource.handle, target.name);
     return target;
+}
+
+std::array<std::uint64_t, 4> find_game_resource_callsites()
+{
+    std::array<std::uint64_t, 4> result = {};
+    void *frames[32] = {};
+    const USHORT count = CaptureStackBackTrace(0, static_cast<DWORD>(std::size(frames)),
+                                                frames, nullptr);
+    std::size_t output = 0;
+    for (USHORT i = 0; i < count && output < result.size(); ++i)
+    {
+        const auto address = reinterpret_cast<std::uintptr_t>(frames[i]);
+        if (address >= g_exe_base && address < g_exe_end)
+            result[output++] = static_cast<std::uint64_t>(address - g_exe_base);
+    }
+    return result;
+}
+
+bool on_create_resource(reshade::api::device *, reshade::api::resource_desc &desc,
+                        reshade::api::subresource_data *, reshade::api::resource_usage)
+{
+    g_pending_resource = {};
+    if (desc.type != reshade::api::resource_type::texture_2d)
+        return false;
+    g_pending_resource.width = desc.texture.width;
+    g_pending_resource.height = desc.texture.height;
+    g_pending_resource.format = static_cast<std::uint32_t>(desc.texture.format);
+    g_pending_resource.game_callsites = find_game_resource_callsites();
+    g_pending_resource.valid = true;
+    return false;
+}
+
+void on_init_resource(reshade::api::device *, const reshade::api::resource_desc &desc,
+                      const reshade::api::subresource_data *, reshade::api::resource_usage,
+                      reshade::api::resource resource)
+{
+    if (!g_pending_resource.valid || resource.handle == 0 ||
+        desc.type != reshade::api::resource_type::texture_2d)
+        return;
+    if (desc.texture.width == g_pending_resource.width &&
+        desc.texture.height == g_pending_resource.height &&
+        static_cast<std::uint32_t>(desc.texture.format) == g_pending_resource.format)
+    {
+        AcquireSRWLockExclusive(&g_pipeline_lock);
+        g_resource_callsites[resource.handle] = g_pending_resource.game_callsites;
+        ReleaseSRWLockExclusive(&g_pipeline_lock);
+    }
+    g_pending_resource = {};
+}
+
+void on_destroy_resource(reshade::api::device *, reshade::api::resource resource)
+{
+    AcquireSRWLockExclusive(&g_pipeline_lock);
+    g_resource_callsites.erase(resource.handle);
+    ReleaseSRWLockExclusive(&g_pipeline_lock);
 }
 
 void record_bound_state(reshade::api::command_list *cmd)
@@ -622,15 +697,23 @@ void write_captured_frame(LONG64 frame_number)
             if (target.resource == 0)
                 fprintf(file, " rt%u=null", i);
             else
-                fprintf(file, " rt%u=%llX:%ux%u:f%u%s%s", i,
+                fprintf(file, " rt%u=%llX:%ux%u:f%u@%llX/%llX/%llX/%llX%s%s", i,
                         static_cast<unsigned long long>(target.resource),
                         target.width, target.height, target.format,
+                        static_cast<unsigned long long>(target.creation_sites[0]),
+                        static_cast<unsigned long long>(target.creation_sites[1]),
+                        static_cast<unsigned long long>(target.creation_sites[2]),
+                        static_cast<unsigned long long>(target.creation_sites[3]),
                         target.name[0] != '\0' ? ":" : "", target.name);
         }
         if (pass.depth.resource != 0)
-            fprintf(file, " ds=%llX:%ux%u:f%u%s%s",
+            fprintf(file, " ds=%llX:%ux%u:f%u@%llX/%llX/%llX/%llX%s%s",
                     static_cast<unsigned long long>(pass.depth.resource),
                     pass.depth.width, pass.depth.height, pass.depth.format,
+                    static_cast<unsigned long long>(pass.depth.creation_sites[0]),
+                    static_cast<unsigned long long>(pass.depth.creation_sites[1]),
+                    static_cast<unsigned long long>(pass.depth.creation_sites[2]),
+                    static_cast<unsigned long long>(pass.depth.creation_sites[3]),
                     pass.depth.name[0] != '\0' ? ":" : "", pass.depth.name);
         if (pass.first_vertex_shader != 0 || pass.first_pixel_shader != 0)
             fprintf(file, " vs=%016llX..%016llX ps=%016llX..%016llX",
@@ -642,9 +725,13 @@ void write_captured_frame(LONG64 frame_number)
         {
             const auto &input = pass.pixel_inputs[i];
             if (input.resource != 0)
-                fprintf(file, " t%u=%llX:%ux%u:f%u%s%s", i,
+                fprintf(file, " t%u=%llX:%ux%u:f%u@%llX/%llX/%llX/%llX%s%s", i,
                         static_cast<unsigned long long>(input.resource),
                         input.width, input.height, input.format,
+                        static_cast<unsigned long long>(input.creation_sites[0]),
+                        static_cast<unsigned long long>(input.creation_sites[1]),
+                        static_cast<unsigned long long>(input.creation_sites[2]),
+                        static_cast<unsigned long long>(input.creation_sites[3]),
                         input.name[0] != '\0' ? ":" : "", input.name);
         }
         for (std::uint32_t i = 0; i < std::size(pass.pixel_constant_buffers); ++i)
@@ -932,6 +1019,9 @@ bool register_callbacks()
     reg(reshade::addon_event::init_device, reinterpret_cast<void *>(&on_init_device));
     reg(reshade::addon_event::destroy_device, reinterpret_cast<void *>(&on_destroy_device));
     reg(reshade::addon_event::init_swapchain, reinterpret_cast<void *>(&on_init_swapchain));
+    reg(reshade::addon_event::create_resource, reinterpret_cast<void *>(&on_create_resource));
+    reg(reshade::addon_event::init_resource, reinterpret_cast<void *>(&on_init_resource));
+    reg(reshade::addon_event::destroy_resource, reinterpret_cast<void *>(&on_destroy_resource));
     reg(reshade::addon_event::map_buffer_region, reinterpret_cast<void *>(&on_map_buffer_region));
     reg(reshade::addon_event::unmap_buffer_region, reinterpret_cast<void *>(&on_unmap_buffer_region));
     reg(reshade::addon_event::update_buffer_region, reinterpret_cast<void *>(&on_update_buffer_region));
@@ -972,6 +1062,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         make_sibling_path(module, L"dos2-dlss-frame-trace.log", g_trace_path);
         make_sibling_path(module, L"DOS2DLSS-Shaders", g_shader_dir);
         make_sibling_path(module, L"DOS2DLSS-NGX", g_ngx_path);
+        MODULEINFO exe_info = {};
+        if (GetModuleInformation(GetCurrentProcess(), GetModuleHandleW(nullptr),
+                                 &exe_info, sizeof(exe_info)))
+        {
+            g_exe_base = reinterpret_cast<std::uintptr_t>(exe_info.lpBaseOfDll);
+            g_exe_end = g_exe_base + exe_info.SizeOfImage;
+        }
         FILE *clear = nullptr;
         if (_wfopen_s(&clear, g_log_path, L"w") == 0 && clear != nullptr) fclose(clear);
 
