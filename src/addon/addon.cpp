@@ -20,7 +20,7 @@
 #include "reshade_api.hpp"
 #include "reshade_events.hpp"
 
-extern "C" __declspec(dllexport) const char *NAME = "DOS2 DLSS 0.6.0";
+extern "C" __declspec(dllexport) const char *NAME = "DOS2 DLSS 0.6.1";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Controls and diagnostics for the native Divinity: Original Sin 2 DLSS integration.";
 
@@ -56,10 +56,14 @@ volatile LONG g_frame_scene_w = 0;
 volatile LONG g_frame_scene_h = 0;
 volatile LONG g_frame_color_format = 0;
 volatile LONG g_frame_depth_format = 0;
-volatile LONG64 g_native_ui_resource = 0;
+std::unordered_set<std::uint64_t> g_native_ui_resources;
+volatile LONG64 g_last_dlss_evaluation_frame = -1;
 bool g_diagnostics = false;
 constexpr std::uint64_t kCombineUiPixelShader = 0x7D52DF001176EB8Dull;
-constexpr std::uint64_t kNativeUiAllocationSite = 0x1EE8A2Eull;
+// This allocation path belongs to DOS2's full-resolution Scaleform/UI target
+// on the supported executable. It is available before the first UI draw, while
+// learning the texture from the final CombineUI pass is one frame too late.
+constexpr std::uint64_t kNativeUiAllocationSite = 0x1DC57A3ull;
 thread_local int g_current_screen_level = -1;
 thread_local bool g_current_native_ui_target = false;
 thread_local bool g_current_gbuffer_target = false;
@@ -150,6 +154,7 @@ thread_local reshade::api::resource_view g_bound_pixel_inputs[16] = {};
 thread_local reshade::api::buffer_range g_bound_vertex_constant_buffers[16] = {};
 thread_local reshade::api::buffer_range g_bound_pixel_constant_buffers[16] = {};
 thread_local MappedBuffer g_mapped_buffer = {};
+thread_local bool g_internal_srv_bind = false;
 
 std::uint64_t hash_shader(const void *data, std::size_t size)
 {
@@ -246,10 +251,8 @@ void on_init_resource(reshade::api::device *, const reshade::api::resource_desc 
 
 void on_destroy_resource(reshade::api::device *, reshade::api::resource resource)
 {
-    if (static_cast<std::uint64_t>(InterlockedCompareExchange64(
-            &g_native_ui_resource, 0, 0)) == resource.handle)
-        InterlockedExchange64(&g_native_ui_resource, 0);
     AcquireSRWLockExclusive(&g_pipeline_lock);
+    g_native_ui_resources.erase(resource.handle);
     g_resource_callsites.erase(resource.handle);
     ReleaseSRWLockExclusive(&g_pipeline_lock);
 }
@@ -458,7 +461,11 @@ void on_destroy_device(reshade::api::device *)
     g_jittered_per_view_source = 0;
     g_jittered_per_view_hash = 0;
     g_jittered_per_view_frame = -1;
+    InterlockedExchange64(&g_last_dlss_evaluation_frame, -1);
     g_camera_override_bound = false;
+    AcquireSRWLockExclusive(&g_pipeline_lock);
+    g_native_ui_resources.clear();
+    ReleaseSRWLockExclusive(&g_pipeline_lock);
     g_frame_pipeline.shutdown();
     g_ngx.shutdown(g_mapping.get(), &log_message);
 }
@@ -791,7 +798,7 @@ void prepare_draw_resolution(reshade::api::command_list *cmd)
         ? (std::max)(1L, render_height >> g_current_screen_level) : native_height;
     const float width = static_cast<float>(desired_width);
     const float height = static_cast<float>(desired_height);
-    if (g_current_scene_depth_target && !fullscreen)
+    if (g_current_scene_depth_target && !g_current_native_ui_target && !fullscreen)
     {
         float jitter_x = 0.0f;
         float jitter_y = 0.0f;
@@ -814,6 +821,10 @@ void evaluate_native_dlss(reshade::api::command_list *cmd)
         InterlockedCompareExchange(&state->quality_mode, 0, 0) <=
             static_cast<LONG>(dos2dlss::QualityMode::off) ||
         InterlockedCompareExchange(&state->ngx_feature_created, 0, 0) == 0)
+        return;
+
+    const LONG64 frame = InterlockedCompareExchange64(&state->frame_number, 0, 0);
+    if (InterlockedCompareExchange64(&g_last_dlss_evaluation_frame, 0, 0) == frame)
         return;
 
     float current_view_projection[16] = {};
@@ -848,13 +859,25 @@ void evaluate_native_dlss(reshade::api::command_list *cmd)
         ui_view->Release();
         if (ui_resource != nullptr)
         {
-            InterlockedExchange64(&g_native_ui_resource,
-                                  reinterpret_cast<LONG64>(ui_resource));
+            AcquireSRWLockExclusive(&g_pipeline_lock);
+            g_native_ui_resources.insert(reinterpret_cast<std::uint64_t>(ui_resource));
+            ReleaseSRWLockExclusive(&g_pipeline_lock);
             ui_resource->Release();
         }
     }
     ID3D11ShaderResourceView *input_view = nullptr;
-    context->PSGetShaderResources(0, 1, &input_view);
+    // Binding the DLSS output for CombineUI may persist into the next frame
+    // because DOS2 caches unchanged D3D11 bindings. ReShade still knows the
+    // texture requested by the game, provided our own bind is not fed back into
+    // descriptor tracking, so prefer that view over the physical context slot.
+    if (g_bound_pixel_inputs[0].handle != 0)
+    {
+        input_view = reinterpret_cast<ID3D11ShaderResourceView *>(
+            g_bound_pixel_inputs[0].handle);
+        input_view->AddRef();
+    }
+    else
+        context->PSGetShaderResources(0, 1, &input_view);
     if (input_view == nullptr)
         return;
     ID3D11Resource *input_color = nullptr;
@@ -875,7 +898,10 @@ void evaluate_native_dlss(reshade::api::command_list *cmd)
     input_color->Release();
     if (output_view != nullptr)
     {
+        g_internal_srv_bind = true;
         context->PSSetShaderResources(0, 1, &output_view);
+        g_internal_srv_bind = false;
+        InterlockedExchange64(&g_last_dlss_evaluation_frame, frame);
         InterlockedExchange(&state->native_dlss_active, 1);
     }
 }
@@ -938,12 +964,13 @@ void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
             AcquireSRWLockShared(&g_pipeline_lock);
             const auto origin = g_resource_callsites.find(first_resource.handle);
             if (origin != g_resource_callsites.end())
+                g_current_native_ui_target = std::find(
+                    origin->second.begin(), origin->second.end(),
+                    kNativeUiAllocationSite) != origin->second.end();
+            if (!g_current_native_ui_target)
                 g_current_native_ui_target =
-                    origin->second[3] == kNativeUiAllocationSite;
+                    g_native_ui_resources.contains(first_resource.handle);
             ReleaseSRWLockShared(&g_pipeline_lock);
-            if (first_resource.handle == static_cast<std::uint64_t>(
-                    InterlockedCompareExchange64(&g_native_ui_resource, 0, 0)))
-                g_current_native_ui_target = true;
         }
         else if (dsv.handle != 0)
         {
@@ -1143,6 +1170,8 @@ void on_push_descriptors(reshade::api::command_list *, reshade::api::shader_stag
     const std::uint32_t count = (std::min)(update.count, 16u - update.binding);
     if (pixel && update.type == reshade::api::descriptor_type::shader_resource_view)
     {
+        if (g_internal_srv_bind)
+            return;
         const auto *views = static_cast<const reshade::api::resource_view *>(update.descriptors);
         for (std::uint32_t i = 0; i < count; ++i)
             g_bound_pixel_inputs[update.binding + i] = views[i];
@@ -1603,7 +1632,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         }
         InterlockedExchange(&state->addon_ready, 1);
         update_status(L"ReShade probe panel registered.");
-        log_line("DOS2 DLSS 0.6.0 registered with ReShade.");
+        log_line("DOS2 DLSS 0.6.1 registered with ReShade.");
     }
     else if (reason == DLL_PROCESS_DETACH && reserved == nullptr)
     {
