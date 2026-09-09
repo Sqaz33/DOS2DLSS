@@ -1,5 +1,11 @@
 # DOS2DLSS
 
+> **Preview release:** download compiled files from [Releases](https://github.com/Sqaz33/DOS2DLSS/releases). Follow [the Russian installation guide](docs/release-install-ru.md).
+>
+> **Current known issues:** Quality/Balanced/Performance can produce displaced interaction outlines, stale white silhouettes and UI fragments around object HP tooltips. This is NOT fixed. Start with DLAA. Character motion vectors are not implemented, and full DLAA stability is not established.
+>
+> **Current NR behavior:** the custom Bridge bypasses mirroring when NR is off and suppresses redundant native DLSS when NR is on. These paths were checked in separate menu launches; live checkbox handover and gameplay FPS improvements remain unverified. This supersedes the older validation/paused-Bridge statements below.
+
 Experimental native DLSS integration for **Divinity: Original Sin 2 – Definitive Edition**.
 
 The intended rendering path is:

@@ -53,6 +53,11 @@ Copy-Item -LiteralPath $loaderSource -Destination $bink -Force
 
 Copy-Item -LiteralPath $nativeSource -Destination (Join-Path $nativeMods 'DOS2DLSSNative.dll') -Force
 Copy-Item -LiteralPath $addonSource -Destination (Join-Path $bin 'dos2-dlss.addon64') -Force
+$dlssRuntime = Join-Path $BuildDirectory 'nvngx_dlss.dll'
+if ((Test-Path -LiteralPath $dlssRuntime) -and
+    -not (Test-Path -LiteralPath (Join-Path $bin 'nvngx_dlss.dll'))) {
+    Copy-Item -LiteralPath $dlssRuntime -Destination (Join-Path $bin 'nvngx_dlss.dll')
+}
 if (-not (Test-Path -LiteralPath (Join-Path $bin 'dos2-dlss.ini'))) {
     Copy-Item -LiteralPath $configSource -Destination (Join-Path $bin 'dos2-dlss.ini')
 }
