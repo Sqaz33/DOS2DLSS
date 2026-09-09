@@ -1,16 +1,18 @@
 [CmdletBinding()]
 param(
-    [string]$GameRoot = 'D:\SteamLibrary\steamapps\common\Divinity Original Sin 2',
-    [string]$BuildDirectory = (Join-Path $PSScriptRoot '..\build'),
+    [string]$GameRoot,
+    [string]$BuildDirectory,
     [switch]$PauseNeuralRendering
 )
 
 $ErrorActionPreference = 'Stop'
+if (-not $BuildDirectory) { $BuildDirectory = Join-Path $PSScriptRoot '..\build' }
 
 $expectedExeHash = '1D14A07CB7F22EBA64559789F826C9FC3A6C54C420FE6F1C8532316B5E33A33D'
 $expectedBinkHash = 'FCA6CEC726FF3E9FB9444B96C5AF38ED7C70C5D03F5F80557D5C4ABD099E8A5E'
 $loaderHash = '6C2932D54E56DCB1A6E9E0D9CD13C2DBACB9BDF9D4175B0BCBB0E0CAB0FC20FC'
-$bin = Join-Path $GameRoot 'DefEd\bin'
+. (Join-Path $PSScriptRoot 'installer-common.ps1')
+$bin = Resolve-GameBin $GameRoot
 $exe = Join-Path $bin 'EoCApp.exe'
 $nativeSource = Join-Path $BuildDirectory 'DOS2DLSSNative.dll'
 $addonSource = Join-Path $BuildDirectory 'dos2-dlss.addon64'
@@ -124,7 +126,7 @@ if (Test-Path -LiteralPath $bridgeConfig) {
     if (-not $PauseNeuralRendering -and (Test-Path -LiteralPath $nrBridge)) {
         $text = $text -replace '(?m)^stage\s*=.*$', 'stage=3'
     }
-    Set-Content -LiteralPath $bridgeConfig -Value $text -Encoding utf8NoBOM
+    Write-Utf8File -LiteralPath $bridgeConfig -Value $text
 }
 
 $rhiFiles = @(
@@ -139,26 +141,26 @@ foreach ($rhiFile in $rhiFiles) {
 
 $settingsPath = $rhiFiles[0]
 if (Test-Path -LiteralPath $settingsPath) {
-    $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
-    $selection = $settings.PerGameAddonSelection | ConvertFrom-Json -AsHashtable
+    $settings = Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $selection = $settings.PerGameAddonSelection | ConvertFrom-JsonMap
     $key = 'Divinity: Original Sin 2|Steam'
     if ($selection.ContainsKey($key)) {
         $pausedAddons = @('DLSS5 Feeder')
         if ($PauseNeuralRendering) { $pausedAddons += @('DLSS5 Tool', 'DLSS5 DX11 Bridge', 'RenoDX Upgrade') }
         $selection[$key] = @($selection[$key] | Where-Object { $_ -notin $pausedAddons })
         $settings.PerGameAddonSelection = $selection | ConvertTo-Json -Compress
-        $settings | ConvertTo-Json -Compress -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8NoBOM
+        $settings | ConvertTo-Json -Compress -Depth 20 | Write-Utf8File -LiteralPath $settingsPath
     }
 }
 
 $deploymentsPath = $rhiFiles[1]
 if (Test-Path -LiteralPath $deploymentsPath) {
-    $deployments = Get-Content -LiteralPath $deploymentsPath -Raw | ConvertFrom-Json -AsHashtable
+    $deployments = Get-Content -LiteralPath $deploymentsPath -Raw -Encoding UTF8 | ConvertFrom-JsonMap
     if ($deployments.ContainsKey($bin)) {
         $pausedFiles = @('dlss5-feed.addon64', 'dlss5-bridge.addon64')
         if ($PauseNeuralRendering) { $pausedFiles += @('DLSS5 DX11 Bridge.addon64', 'renodx-dlss5.addon64') }
         $deployments[$bin] = @($deployments[$bin] | Where-Object { $_ -notin $pausedFiles })
-        $deployments | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $deploymentsPath -Encoding utf8NoBOM
+        $deployments | ConvertTo-Json -Depth 10 | Write-Utf8File -LiteralPath $deploymentsPath
     }
 }
 
@@ -167,7 +169,7 @@ if (Test-Path -LiteralPath $deploymentsPath) {
     GameRoot = $GameRoot
     Renamed = $renamed
     RhiFiles = @($rhiFiles | Where-Object { Test-Path -LiteralPath $_ })
-} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $statePath -Encoding utf8NoBOM
+} | ConvertTo-Json -Depth 8 | Write-Utf8File -LiteralPath $statePath
 
 Write-Host 'DOS2DLSS installed.'
 Write-Host 'Launch the game through RHI or Steam and open ReShade with F11.'

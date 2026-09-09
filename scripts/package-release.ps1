@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([string]$Version = '0.6.1-preview.1')
+param([string]$Version = '0.6.1-preview.2')
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^[0-9A-Za-z.-]+$') { throw 'Invalid version.' }
 $root = Split-Path $PSScriptRoot -Parent
@@ -14,7 +14,7 @@ foreach ($name in @('DOS2DLSSNative.dll', 'dos2-dlss.addon64', 'dos2-nr-bridge.a
 Copy-Item (Join-Path $root 'third_party\nvidia_dlss\lib\Windows_x86_64\rel\nvngx_dlss.dll') (Join-Path $package 'build')
 Copy-Item (Join-Path $root 'third_party\native_mod_loader\bink2w64.dll') (Join-Path $package 'third_party\native_mod_loader')
 Copy-Item (Join-Path $root 'config\dos2-dlss.ini') (Join-Path $package 'config')
-foreach ($name in @('install.ps1', 'uninstall.ps1')) {
+foreach ($name in @('install.ps1', 'uninstall.ps1', 'installer-common.ps1')) {
     Copy-Item (Join-Path $PSScriptRoot $name) (Join-Path $package 'scripts')
 }
 Copy-Item (Join-Path $root 'docs\release-install-ru.md') (Join-Path $package 'INSTALL-RU.md')
@@ -25,19 +25,22 @@ Copy-Item (Join-Path $root 'third_party\dlss5_bridge_src\LICENSE') (Join-Path $p
 Copy-Item (Join-Path $root 'third_party\reshade\LICENSE.md') (Join-Path $package 'licenses\ReShade-SDK.md')
 @'
 @echo off
-where pwsh.exe >nul 2>&1
-if errorlevel 1 (
-  echo PowerShell 7 is required. See INSTALL-RU.md.
-  pause
-  exit /b 1
-)
-if "%~1"=="" (
-  pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\install.ps1"
-) else (
-  pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\install.ps1" -GameRoot "%~1"
-)
+setlocal
+set "PSModulePath=%SystemRoot%\System32\WindowsPowerShell\v1.0\Modules"
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\install.ps1"
+set "installResult=%errorlevel%"
 pause
+exit /b %installResult%
 '@ | Set-Content (Join-Path $package 'Install.cmd') -Encoding ascii
+@'
+@echo off
+setlocal
+set "PSModulePath=%SystemRoot%\System32\WindowsPowerShell\v1.0\Modules"
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\uninstall.ps1"
+set "installResult=%errorlevel%"
+pause
+exit /b %installResult%
+'@ | Set-Content (Join-Path $package 'Uninstall.cmd') -Encoding ascii
 $revision = & git -C $root rev-parse HEAD
 "Version=$Version`nSourceCommit=$revision" | Set-Content (Join-Path $package 'BUILD.txt') -Encoding ascii
 Get-ChildItem $package -File -Recurse | Sort-Object FullName | ForEach-Object {

@@ -1,10 +1,11 @@
 [CmdletBinding()]
 param(
-    [string]$GameRoot = 'D:\SteamLibrary\steamapps\common\Divinity Original Sin 2'
+    [string]$GameRoot
 )
 
 $ErrorActionPreference = 'Stop'
-$bin = Join-Path $GameRoot 'DefEd\bin'
+. (Join-Path $PSScriptRoot 'installer-common.ps1')
+$bin = Resolve-GameBin $GameRoot
 $backup = Join-Path $bin 'DOS2DLSS-Backup'
 $statePath = Join-Path $backup 'install-state.json'
 
@@ -26,7 +27,7 @@ if (Test-Path -LiteralPath $binkOriginal) {
 }
 
 if (Test-Path -LiteralPath $statePath) {
-    $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
     foreach ($item in $state.Renamed) {
         if (Test-Path -LiteralPath $item.Disabled) {
             Move-Item -LiteralPath $item.Disabled -Destination $item.Active -Force
