@@ -31,3 +31,12 @@ Verified on 2026-10-22:
 - Profile Debug_Client_Profile_1 displayed stale menu labels after switching; restarting from game working directory restored sdf and enabled Continue. No profile binary edits were needed.
 - Installer read-handle replacement test passed with original backup intact. Diagnostic probe-scale is forbidden when NGX is initialized.
 - Test PID 29500 closed. Native UI baseline was tested with NR paused; final installation restores the previous NR addon files. No FPS or NR improvement is claimed.
+
+Performance/artifact check, 2026-10-22:
+- User explicitly left the game foreground for measurement after the first attempts were interrupted by Chrome. Added scripts/benchmark.ps1: Present counter / monotonic elapsed time, foreground guard, reverse rounds, CSV/status output, no frame-percentile claim. PresentMon ETW denied without Windows admin/Performance Log Users access; no UAC or membership changes made.
+- RTX3070/617.14, 3440x1440, NR off, VSync temporarily off in game and ReLimiter, Diagnostics0. nr-off-full two-round averages: Off134.9, DLAA98.0, Quality138.3, Balanced143.7, Performance153.5 FPS. Small Quality gain; no large performance improvement claim.
+- Matched original-save location: Bridge absent Off122.9/Quality133.0 versus restored Bridge+RenoDX, NR off, Off123.1/Quality133.2. Open-warning run bridge-gated excluded; bridge-gated-clear used. Normal bypass log confirms no mirror with NR off.
+- NR on Quality11.22 FPS; overlay ACTIVE/NR INJECTED, successful NR frames, GPU99%, ~6.6GB VRAM. Reverse-toggle attempt never confirmed NR off, so its 10.1FPS result is NOT an NR-off measurement. Live reverse handover still unverified.
+- ~7s/60fps game-window recordings each Off/DLAA/Quality: no full-black frames. UI/second-object outline retained. No broad claim about foliage or animated-object motion vectors.
+- Found story submenu Quality black-background/upper-left-subrectangle defect with no NR addons, auto Debug profile. Off correct. Evidence story-mode-0/2.png, tracked as unresolved rather than silently declared fixed.
+- Test PID1536 terminated and waited for exit; original four config files restored, NR addon files restored, game closed. Details in docs/performance-0.6.2.md. No render algorithm edits in this verification session.

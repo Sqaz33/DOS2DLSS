@@ -4,7 +4,9 @@
 >
 > **Development build 0.6.2-dev:** fixes displaced interaction masks and missing text when starting directly in Super Resolution. A loaded 3440x1440 save was checked in Quality, Balanced, Performance and DLAA. See [the validation record](docs/text-and-outline-fix.md) for the exact scope. Existing release downloads do not include these changes yet.
 >
-> **Current NR behavior:** the custom Bridge bypasses mirroring when NR is off and suppresses redundant native DLSS when NR is on. These paths were checked in separate menu launches; live checkbox handover and gameplay FPS improvements remain unverified. This supersedes the older validation/paused-Bridge statements below.
+> **Current NR behavior:** the custom Bridge bypasses mirroring when NR is off and suppresses redundant native DLSS when NR is on. The latest matched gameplay check found no measurable Bridge penalty with NR off and confirmed active NR output. Reliable reverse handover from NR on to off is still unverified.
+>
+> **Performance check (2026-10-22):** on RTX 3070 at 3440x1440, Quality provided a small gain, Performance about 14%, and DLAA cost about 27% versus processing Off in the tested scene. NR off showed no measurable Bridge penalty in a separate matched comparison; active NR ran around 11 FPS. A black-background defect remains in the story submenu with Quality. See [results and limits](docs/performance-0.6.2.md).
 
 Experimental native DLSS integration for **Divinity: Original Sin 2 – Definitive Edition**.
 
