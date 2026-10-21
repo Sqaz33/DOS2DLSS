@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "gpu_profiler.hpp"
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
@@ -23,6 +24,7 @@ public:
     bool initialize(ID3D11Device *device, LogFn log);
     void set_scene_depth(ID3D11Resource *depth);
     void reset_history();
+    void set_profiling(bool enabled, bool legacy) { gpu_profiler_.configure(enabled, legacy); }
     ID3D11ShaderResourceView *evaluate(ID3D11DeviceContext *context,
                                        ID3D11Resource *color,
                                        const float current_view_projection[16],
@@ -36,6 +38,7 @@ public:
     void shutdown();
 
 private:
+    DlssGpuProfiler gpu_profiler_;
     bool ensure_resources(std::uint32_t render_width, std::uint32_t render_height,
                           std::uint32_t output_width, std::uint32_t output_height,
                           LogFn log);

@@ -323,6 +323,8 @@ ID3D11ShaderResourceView *FramePipeline::evaluate(
     if (context == nullptr || color == nullptr || current_view_projection == nullptr ||
         !ensure_resources(render_width, render_height, output_width, output_height, log))
         return nullptr;
+    DlssGpuProfiler::Scope gpu_profile(gpu_profiler_, device_, context,
+                                      static_cast<unsigned>(state->quality_mode), log);
     ID3D11Resource *ngx_color = prepare_color_input(
         context, color, render_width, render_height, log);
     if (ngx_color == nullptr)
@@ -392,6 +394,7 @@ ID3D11ShaderResourceView *FramePipeline::evaluate(
     release(old_output);
 
     InterlockedExchange(&state->camera_motion_ready, 1);
+    gpu_profiler_.prepared(context);
     const bool succeeded = ngx.evaluate(context, ngx_color, output_texture_, scene_depth_,
                                         motion_texture_, render_width, render_height,
                                         jitter_x, jitter_y, reset, state, log);
@@ -403,6 +406,7 @@ ID3D11ShaderResourceView *FramePipeline::evaluate(
 
 void FramePipeline::shutdown()
 {
+    gpu_profiler_.shutdown();
     release(output_view_);
     release(output_texture_);
     release(motion_uav_);

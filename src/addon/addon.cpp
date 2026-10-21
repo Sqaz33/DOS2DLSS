@@ -58,6 +58,9 @@ ID3D11Buffer *g_jittered_per_view_constants = nullptr;
 std::size_t g_jittered_per_view_size = 0;
 std::uint64_t g_jittered_per_view_source = 0;
 std::uint64_t g_jittered_per_view_hash = 0;
+std::uint64_t g_jittered_per_view_revision = 0;
+float g_jittered_render_width = 0, g_jittered_render_height = 0;
+float g_jittered_x = 0, g_jittered_y = 0;
 LONG64 g_jittered_per_view_frame = -1;
 volatile LONG64 g_frame_draws = 0;
 volatile LONG64 g_frame_indexed_draws = 0;
@@ -69,6 +72,16 @@ volatile LONG g_frame_depth_format = 0;
 std::unordered_set<std::uint64_t> g_native_ui_resources;
 volatile LONG64 g_last_dlss_evaluation_frame = -1;
 bool g_diagnostics = false;
+bool g_perf_legacy = false;
+bool g_perf_profile = false;
+std::uint64_t g_snapshot_revision = 0;
+std::uint64_t g_camera_calls = 0, g_camera_cache_hits = 0;
+std::uint64_t g_camera_cpu_ticks = 0, g_scoped_draws = 0, g_bypassed_draws = 0;
+struct CameraCpuScope {
+    LARGE_INTEGER start = {};
+    CameraCpuScope() { if (g_perf_profile) QueryPerformanceCounter(&start); }
+    ~CameraCpuScope() { if (start.QuadPart) { LARGE_INTEGER end; QueryPerformanceCounter(&end); g_camera_cpu_ticks += end.QuadPart-start.QuadPart; } }
+};
 constexpr std::uint64_t kCombineUiPixelShader = 0x7D52DF001176EB8Dull;
 // This allocation path belongs to DOS2's full-resolution Scaleform/UI target
 // on the supported executable. It is available before the first UI draw, while
@@ -156,6 +169,7 @@ struct BufferSnapshot
     std::array<std::uint8_t, 512> bytes = {};
     std::size_t size = 0;
     bool ui_view = false;
+    std::uint64_t revision = 0;
 };
 
 struct MappedBuffer
@@ -353,6 +367,7 @@ void save_buffer_snapshot(std::uint64_t resource, const void *data,
             snapshot.ui_view = view[i] == ((i % 5 == 0) ? 1.0f : 0.0f);
     }
     AcquireSRWLockExclusive(&g_pipeline_lock);
+    snapshot.revision = ++g_snapshot_revision;
     g_buffer_snapshots[resource] = snapshot;
     ReleaseSRWLockExclusive(&g_pipeline_lock);
 }
@@ -684,6 +699,8 @@ bool bind_jittered_camera_constants(ID3D11DeviceContext *context,
                                     float jitter_x, float jitter_y,
                                     float render_width, float render_height)
 {
+    CameraCpuScope cpu_profile;
+    if (g_perf_profile) ++g_camera_calls;
     if (context == nullptr || state == nullptr || render_width <= 0.0f ||
         render_height <= 0.0f)
         return false;
@@ -693,16 +710,31 @@ bool bind_jittered_camera_constants(ID3D11DeviceContext *context,
     if (source.buffer.handle == 0 || source.offset != 0)
         return false;
 
+    const auto frame = InterlockedCompareExchange64(&state->frame_number, 0, 0);
     BufferSnapshot snapshot;
     bool found = false;
+    bool cache_hit = false;
     AcquireSRWLockShared(&g_pipeline_lock);
     const auto entry = g_buffer_snapshots.find(source.buffer.handle);
     if (entry != g_buffer_snapshots.end() && entry->second.size >= sizeof(float) * 48)
     {
-        snapshot = entry->second;
+        cache_hit = !g_perf_legacy && g_jittered_per_view_constants != nullptr &&
+            g_jittered_per_view_frame == frame && g_jittered_per_view_source == source.buffer.handle &&
+            g_jittered_per_view_revision == entry->second.revision &&
+            g_jittered_render_width == render_width && g_jittered_render_height == render_height &&
+            g_jittered_x == jitter_x && g_jittered_y == jitter_y;
+        if (!cache_hit) snapshot = entry->second;
         found = true;
     }
     ReleaseSRWLockShared(&g_pipeline_lock);
+    if (cache_hit) {
+        if (g_perf_profile) ++g_camera_cache_hits;
+        context->VSSetConstantBuffers(12, 1, &g_jittered_per_view_constants);
+        context->PSSetConstantBuffers(12, 1, &g_jittered_per_view_constants);
+        g_camera_override_bound = true;
+        InterlockedExchange(&state->camera_jitter_ready, 1);
+        return true;
+    }
     if (!found || snapshot.size % 16 != 0)
         return false;
 
@@ -727,12 +759,13 @@ bool bind_jittered_camera_constants(ID3D11DeviceContext *context,
     jitter_matrix(values + 16);
     jitter_matrix(values + 32);
 
-    const auto frame = InterlockedCompareExchange64(&state->frame_number, 0, 0);
-    const auto contents_hash = hash_shader(snapshot.bytes.data(), snapshot.size);
+    const auto contents_hash = g_perf_legacy ? hash_shader(snapshot.bytes.data(), snapshot.size) : snapshot.revision;
     const bool upload = g_jittered_per_view_constants == nullptr ||
         g_jittered_per_view_size != snapshot.size ||
         g_jittered_per_view_source != source.buffer.handle ||
         g_jittered_per_view_hash != contents_hash ||
+        g_jittered_render_width != render_width || g_jittered_render_height != render_height ||
+        g_jittered_x != jitter_x || g_jittered_y != jitter_y ||
         g_jittered_per_view_frame != frame;
     if (g_jittered_per_view_constants == nullptr ||
         g_jittered_per_view_size != snapshot.size)
@@ -769,6 +802,10 @@ bool bind_jittered_camera_constants(ID3D11DeviceContext *context,
         context->Unmap(g_jittered_per_view_constants, 0);
         g_jittered_per_view_source = source.buffer.handle;
         g_jittered_per_view_hash = contents_hash;
+        g_jittered_per_view_revision = snapshot.revision;
+        g_jittered_render_width = render_width;
+        g_jittered_render_height = render_height;
+        g_jittered_x = jitter_x; g_jittered_y = jitter_y;
         g_jittered_per_view_frame = frame;
     }
     context->VSSetConstantBuffers(12, 1, &g_jittered_per_view_constants);
@@ -875,7 +912,8 @@ void prepare_draw_resolution(reshade::api::command_list *cmd)
         bind_viewport_uv_constants(context, true,
             static_cast<float>(render_width) / static_cast<float>(output_width),
             static_cast<float>(render_height) / static_cast<float>(output_height), true);
-    if (g_current_screen_level < 0 && !g_current_native_ui_target)
+    if ((!g_perf_legacy && g_bound_pixel_shader == kCombineUiPixelShader) ||
+        (g_current_screen_level < 0 && !g_current_native_ui_target))
         return;
     const bool scale_scene = !g_current_native_ui_target &&
                              g_bound_pixel_shader != kCombineUiPixelShader;
@@ -1055,6 +1093,7 @@ struct DrawRasterScope
     ID3D11Buffer *pixel_globals = nullptr;
     bool restore_globals = false;
     bool restore_scene_input = false;
+    bool restore_raster = true;
     UINT viewport_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
     UINT scissor_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
     D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
@@ -1062,6 +1101,7 @@ struct DrawRasterScope
     explicit DrawRasterScope(reshade::api::command_list *cmd)
         : context(reinterpret_cast<ID3D11DeviceContext *>(cmd->get_native()))
     {
+        if (g_perf_profile) ++g_scoped_draws;
         restore_scene_input = g_bound_pixel_shader == kCombineUiPixelShader;
         if (restore_scene_input)
             context->PSGetShaderResources(0, 1, &scene_input);
@@ -1070,8 +1110,13 @@ struct DrawRasterScope
             context->VSGetConstantBuffers(0, 1, &vertex_globals);
             context->PSGetConstantBuffers(0, 1, &pixel_globals);
         }
-        context->RSGetViewports(&viewport_count, viewports);
-        context->RSGetScissorRects(&scissor_count, scissors);
+        const auto *state = g_mapping.get();
+        restore_raster = g_perf_legacy || (state != nullptr && state->quality_mode > 1 &&
+            g_current_screen_level >= 0 && g_bound_pixel_shader != kCombineUiPixelShader);
+        if (restore_raster) {
+            context->RSGetViewports(&viewport_count, viewports);
+            context->RSGetScissorRects(&scissor_count, scissors);
+        }
         g_submitting_draw = true;
     }
     ~DrawRasterScope()
@@ -1090,11 +1135,24 @@ struct DrawRasterScope
             g_internal_srv_bind = false;
             if (scene_input != nullptr) scene_input->Release();
         }
-        context->RSSetViewports(viewport_count, viewports);
-        context->RSSetScissorRects(scissor_count, scissors);
+        if (restore_raster) {
+            context->RSSetViewports(viewport_count, viewports);
+            context->RSSetScissorRects(scissor_count, scissors);
+        }
         g_submitting_draw = false;
     }
 };
+
+bool draw_needs_override(const dos2dlss::SharedState *state)
+{
+    if (state == nullptr || state->quality_mode <= 0) return false;
+    if (g_perf_legacy || g_bound_pixel_shader == kCombineUiPixelShader) return true;
+    const bool fullscreen = is_fullscreen_vertex_shader(g_bound_vertex_shader);
+    if (state->quality_mode == 1) return g_current_scene_depth_target && !fullscreen;
+    // Shadow maps and offscreen object/UI previews retain their native raster
+    // state. No DLSS input or jitter is modified by these geometry draws.
+    return g_current_screen_level >= 0 || fullscreen;
+}
 
 bool on_draw(reshade::api::command_list *cmd, std::uint32_t vertices,
              std::uint32_t instances, std::uint32_t first_vertex, std::uint32_t first_instance)
@@ -1103,7 +1161,8 @@ bool on_draw(reshade::api::command_list *cmd, std::uint32_t vertices,
         return false;
     begin_scene_draw_phase();
     const auto *state = g_mapping.get();
-    if (!g_scene_render_phase || is_ui_draw() || state == nullptr || state->quality_mode <= 0) {
+    if (!g_scene_render_phase || is_ui_draw() || !draw_needs_override(state)) {
+        if (g_perf_profile) ++g_bypassed_draws;
         if (g_diagnostics) InterlockedIncrement64(&g_frame_draws);
         if (g_capture_active && g_current_captured_pass >= 0) {
             ++g_captured_passes[g_current_captured_pass].draws;
@@ -1134,7 +1193,8 @@ bool on_draw_indexed(reshade::api::command_list *cmd, std::uint32_t indices,
         return false;
     begin_scene_draw_phase();
     const auto *state = g_mapping.get();
-    if (!g_scene_render_phase || is_ui_draw() || state == nullptr || state->quality_mode <= 0) {
+    if (!g_scene_render_phase || is_ui_draw() || !draw_needs_override(state)) {
+        if (g_perf_profile) ++g_bypassed_draws;
         if (g_diagnostics) InterlockedIncrement64(&g_frame_indexed_draws);
         if (g_capture_active && g_current_captured_pass >= 0) {
             ++g_captured_passes[g_current_captured_pass].indexed_draws;
@@ -1657,6 +1717,33 @@ void on_present(reshade::api::command_queue *queue, reshade::api::swapchain *,
     auto *state = g_mapping.get();
     if (state == nullptr)
         return;
+    // Hidden diagnostic switches permit a controlled legacy/optimized A/B in
+    // one process. They are off/default-fast unless explicitly requested.
+    static unsigned profile_frames = 0;
+    static int profile_mode = -1;
+    bool changed = false;
+    if ((state->frame_number & 31) == 0) {
+        const bool legacy = GetPrivateProfileIntW(L"DOS2DLSS", L"PerfLegacyHooks", 0, g_config_path) != 0;
+        const bool profiling = GetPrivateProfileIntW(L"DOS2DLSS", L"ProfilePerformance", 0, g_config_path) != 0;
+        changed = legacy != g_perf_legacy || profiling != g_perf_profile;
+        if (legacy != g_perf_legacy) g_jittered_per_view_frame = -1;
+        g_perf_legacy = legacy; g_perf_profile = profiling;
+    }
+    g_frame_pipeline.set_profiling(g_perf_profile, g_perf_legacy);
+    if (changed || profile_mode != state->quality_mode) {
+        g_camera_calls = g_camera_cache_hits = g_camera_cpu_ticks = g_scoped_draws = g_bypassed_draws = 0;
+        profile_frames = 0; profile_mode = state->quality_mode;
+    }
+    if (g_perf_profile && ++profile_frames >= 120) {
+        LARGE_INTEGER frequency; QueryPerformanceFrequency(&frequency);
+        log_line("PERF CPU mode=%d legacy=%d frames=%u camera_ms=%.3f camera_calls=%.1f hits=%.1f scoped_draws=%.1f bypassed_draws=%.1f",
+            profile_mode, g_perf_legacy ? 1 : 0, profile_frames,
+            1000.0 * g_camera_cpu_ticks / static_cast<double>(frequency.QuadPart) / profile_frames,
+            static_cast<double>(g_camera_calls)/profile_frames, static_cast<double>(g_camera_cache_hits)/profile_frames,
+            static_cast<double>(g_scoped_draws)/profile_frames, static_cast<double>(g_bypassed_draws)/profile_frames);
+        g_camera_calls = g_camera_cache_hits = g_camera_cpu_ticks = g_scoped_draws = g_bypassed_draws = 0;
+        profile_frames = 0;
+    }
     if (g_capture_active)
     {
         write_captured_frame(state->frame_number);
