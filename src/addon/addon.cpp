@@ -1,6 +1,7 @@
 #include "dos2dlss/shared_state.hpp"
 #include "frame_pipeline.hpp"
 #include "ngx_runtime.hpp"
+#include "context_state.hpp"
 
 #include <windows.h>
 #include <psapi.h>
@@ -43,7 +44,16 @@ wchar_t g_shader_dir[MAX_PATH] = {};
 wchar_t g_ngx_path[MAX_PATH] = {};
 dos2dlss::NgxRuntime g_ngx;
 dos2dlss::FramePipeline g_frame_pipeline;
+PrivateContextState g_private_context;
+thread_local bool g_internal_render = false;
+struct InternalRenderScope {
+    bool previous = g_internal_render;
+    InternalRenderScope() { g_internal_render = true; }
+    ~InternalRenderScope() { g_internal_render = previous; }
+};
 ID3D11Buffer *g_scaled_viewport_constants = nullptr;
+ID3D11Buffer *g_scaled_pixel_viewport_constants = nullptr;
+ID3D11Buffer *g_scaled_clear_constants = nullptr;
 ID3D11Buffer *g_jittered_per_view_constants = nullptr;
 std::size_t g_jittered_per_view_size = 0;
 std::uint64_t g_jittered_per_view_source = 0;
@@ -118,6 +128,7 @@ struct PipelineShaders
 {
     std::uint64_t vertex = 0;
     std::uint64_t pixel = 0;
+    std::uint64_t compute = 0;
 };
 
 struct ShaderBlob
@@ -149,6 +160,7 @@ std::unordered_map<std::uint64_t, PipelineShaders> g_pipeline_shaders;
 std::unordered_map<std::uint64_t, ShaderBlob> g_shader_blobs;
 std::unordered_map<std::uint64_t, BufferSnapshot> g_buffer_snapshots;
 thread_local std::uint64_t g_bound_vertex_shader = 0;
+thread_local std::uint64_t g_bound_compute_shader = 0;
 thread_local std::uint64_t g_bound_pixel_shader = 0;
 thread_local reshade::api::resource_view g_bound_pixel_inputs[16] = {};
 thread_local reshade::api::buffer_range g_bound_vertex_constant_buffers[16] = {};
@@ -431,6 +443,10 @@ void on_init_device(reshade::api::device *device)
     if (device->get_api() == reshade::api::device_api::d3d11)
     {
         auto *native_device = reinterpret_cast<ID3D11Device *>(device->get_native());
+        if (!g_private_context.initialize(native_device)) {
+            update_status(L"D3D11.1 context isolation unavailable; DLSS disabled.");
+            return;
+        }
         g_frame_pipeline.initialize(native_device, &log_message);
         if (g_ngx.initialize(native_device, g_ngx_path, g_mapping.get(), &log_message))
             update_status(L"D3D11 active; NVIDIA NGX initialized.");
@@ -447,6 +463,14 @@ void on_init_device(reshade::api::device *device)
 
 void on_destroy_device(reshade::api::device *)
 {
+    if (g_scaled_pixel_viewport_constants != nullptr) {
+        g_scaled_pixel_viewport_constants->Release();
+        g_scaled_pixel_viewport_constants = nullptr;
+    }
+    if (g_scaled_clear_constants != nullptr) {
+        g_scaled_clear_constants->Release();
+        g_scaled_clear_constants = nullptr;
+    }
     if (g_scaled_viewport_constants != nullptr)
     {
         g_scaled_viewport_constants->Release();
@@ -468,6 +492,7 @@ void on_destroy_device(reshade::api::device *)
     ReleaseSRWLockExclusive(&g_pipeline_lock);
     g_frame_pipeline.shutdown();
     g_ngx.shutdown(g_mapping.get(), &log_message);
+    g_private_context.shutdown();
 }
 
 void on_init_swapchain(reshade::api::swapchain *swapchain, bool)
@@ -509,6 +534,8 @@ bool is_fullscreen_vertex_shader(std::uint64_t shader)
     case 0xD0938263903A6857ull:
     case 0xE23AC6CD78CD13BCull:
     case 0xFC1811A3281055CAull:
+    case 0xA24881A89C311963ull: // EoCOutlineBlurH
+    case 0xC168C0D066FEB718ull: // EoCOutlineBlurV
         return true;
     default:
         return false;
@@ -547,14 +574,15 @@ void get_frame_jitter(dos2dlss::SharedState *state, float &x, float &y)
 }
 
 void bind_viewport_uv_constants(ID3D11DeviceContext *context, bool scaled,
-                                float scale_x, float scale_y)
+                                float scale_x, float scale_y, bool pixel = false)
 {
-    const auto &range = g_bound_vertex_constant_buffers[0];
+    const auto &range = pixel ? g_bound_pixel_constant_buffers[0] : g_bound_vertex_constant_buffers[0];
     if (context == nullptr || range.buffer.handle == 0 || range.offset != 0)
         return;
 
     auto *original = reinterpret_cast<ID3D11Buffer *>(range.buffer.handle);
-    context->VSSetConstantBuffers(0, 1, &original);
+    if (pixel) context->PSSetConstantBuffers(0, 1, &original);
+    else context->VSSetConstantBuffers(0, 1, &original);
     if (!scaled)
         return;
 
@@ -571,7 +599,8 @@ void bind_viewport_uv_constants(ID3D11DeviceContext *context, bool scaled,
     if (!found)
         return;
 
-    if (g_scaled_viewport_constants == nullptr)
+    auto *&scaled_buffer = pixel ? g_scaled_pixel_viewport_constants : g_scaled_viewport_constants;
+    if (scaled_buffer == nullptr)
     {
         ID3D11Device *device = nullptr;
         context->GetDevice(&device);
@@ -582,7 +611,7 @@ void bind_viewport_uv_constants(ID3D11DeviceContext *context, bool scaled,
         desc.Usage = D3D11_USAGE_DYNAMIC;
         desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        const HRESULT result = device->CreateBuffer(&desc, nullptr, &g_scaled_viewport_constants);
+        const HRESULT result = device->CreateBuffer(&desc, nullptr, &scaled_buffer);
         device->Release();
         if (FAILED(result))
         {
@@ -597,12 +626,13 @@ void bind_viewport_uv_constants(ID3D11DeviceContext *context, bool scaled,
     values[2] *= scale_x;
     values[3] *= scale_y;
     D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (FAILED(context->Map(g_scaled_viewport_constants, 0, D3D11_MAP_WRITE_DISCARD,
+    if (FAILED(context->Map(scaled_buffer, 0, D3D11_MAP_WRITE_DISCARD,
                             0, &mapped)))
         return;
     std::memcpy(mapped.pData, snapshot.bytes.data(), snapshot.bytes.size());
-    context->Unmap(g_scaled_viewport_constants, 0);
-    context->VSSetConstantBuffers(0, 1, &g_scaled_viewport_constants);
+    context->Unmap(scaled_buffer, 0);
+    if (pixel) context->PSSetConstantBuffers(0, 1, &scaled_buffer);
+    else context->VSSetConstantBuffers(0, 1, &scaled_buffer);
 }
 
 void restore_camera_constants(ID3D11DeviceContext *context)
@@ -768,12 +798,6 @@ void prepare_draw_resolution(reshade::api::command_list *cmd)
         bind_jittered_camera_constants(context, state, jitter_x, jitter_y,
                                        static_cast<float>(output_width),
                                        static_cast<float>(output_height));
-        const D3D11_VIEWPORT viewport = {
-            0.0f, 0.0f, static_cast<float>(output_width),
-            static_cast<float>(output_height), 0.0f, 1.0f };
-        const D3D11_RECT scissor = { 0, 0, output_width, output_height };
-        context->RSSetViewports(1, &viewport);
-        context->RSSetScissorRects(1, &scissor);
         return;
     }
 
@@ -792,6 +816,12 @@ void prepare_draw_resolution(reshade::api::command_list *cmd)
     bind_viewport_uv_constants(context, scale_uv,
         static_cast<float>(render_width) / static_cast<float>(output_width),
         static_cast<float>(render_height) / static_cast<float>(output_height));
+    // The outline PS clamps against VPtoRTScaleBias too; VS-only correction
+    // samples outside the active rectangle and reintroduces stale mask pixels.
+    if (scale_uv && g_bound_pixel_shader == 0x55D5D37A212C2405ull)
+        bind_viewport_uv_constants(context, true,
+            static_cast<float>(render_width) / static_cast<float>(output_width),
+            static_cast<float>(render_height) / static_cast<float>(output_height), true);
     if (g_current_screen_level < 0 && !g_current_native_ui_target)
         return;
     const bool scale_scene = !g_current_native_ui_target &&
@@ -815,11 +845,27 @@ void prepare_draw_resolution(reshade::api::command_list *cmd)
                                        static_cast<float>(render_width),
                                        static_cast<float>(render_height));
     }
-    const D3D11_VIEWPORT viewport = {
-        0.0f, 0.0f, width, height, 0.0f, 1.0f };
-    const D3D11_RECT scissor = { 0, 0, static_cast<LONG>(width), static_cast<LONG>(height) };
-    context->RSSetViewports(1, &viewport);
-    context->RSSetScissorRects(1, &scissor);
+    // Outline masks use object-sized viewports/scissors. Scale their original
+    // rectangle, retaining its origin, rather than replacing it with the screen.
+    const float sx = width / static_cast<float>(native_width);
+    const float sy = height / static_cast<float>(native_height);
+    D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+    D3D11_RECT scissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+    UINT nv = static_cast<UINT>(std::size(viewports)), ns = static_cast<UINT>(std::size(scissors));
+    context->RSGetViewports(&nv, viewports);
+    context->RSGetScissorRects(&ns, scissors);
+    for (UINT i = 0; i < nv; ++i) {
+        viewports[i].TopLeftX *= sx; viewports[i].TopLeftY *= sy;
+        viewports[i].Width *= sx; viewports[i].Height *= sy;
+    }
+    for (UINT i = 0; i < ns; ++i) {
+        scissors[i].left = static_cast<LONG>(std::floor(scissors[i].left * sx));
+        scissors[i].top = static_cast<LONG>(std::floor(scissors[i].top * sy));
+        scissors[i].right = static_cast<LONG>(std::ceil(scissors[i].right * sx));
+        scissors[i].bottom = static_cast<LONG>(std::ceil(scissors[i].bottom * sy));
+    }
+    context->RSSetViewports(nv, viewports);
+    context->RSSetScissorRects(ns, scissors);
 }
 
 void evaluate_native_dlss(reshade::api::command_list *cmd)
@@ -890,10 +936,15 @@ void evaluate_native_dlss(reshade::api::command_list *cmd)
     const auto output_width = static_cast<std::uint32_t>(state->backbuffer_width);
     const auto output_height = static_cast<std::uint32_t>(state->backbuffer_height);
     const bool reset = InterlockedExchange(&state->reset_requested, 0) != 0;
-    ID3D11ShaderResourceView *output_view = g_frame_pipeline.evaluate(
-        context, input_color, current_view_projection, render_width, render_height,
-        output_width, output_height, jitter_x, jitter_y,
-        reset, g_ngx, state, &log_message);
+    ID3D11ShaderResourceView *output_view = nullptr;
+    {
+        InternalRenderScope internal;
+        PrivateContextState::Scope pipeline(g_private_context);
+        if (pipeline.active()) output_view = g_frame_pipeline.evaluate(
+            context, input_color, current_view_projection, render_width, render_height,
+            output_width, output_height, jitter_x, jitter_y,
+            reset, g_ngx, state, &log_message);
+    }
     input_color->Release();
     if (output_view != nullptr)
     {
@@ -912,6 +963,9 @@ struct DrawRasterScope
 {
     ID3D11DeviceContext *context;
     ID3D11ShaderResourceView *scene_input = nullptr;
+    ID3D11Buffer *vertex_globals = nullptr;
+    ID3D11Buffer *pixel_globals = nullptr;
+    bool restore_globals = false;
     bool restore_scene_input = false;
     UINT viewport_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
     UINT scissor_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
@@ -923,12 +977,24 @@ struct DrawRasterScope
         restore_scene_input = g_bound_pixel_shader == kCombineUiPixelShader;
         if (restore_scene_input)
             context->PSGetShaderResources(0, 1, &scene_input);
+        restore_globals = is_fullscreen_vertex_shader(g_bound_vertex_shader);
+        if (restore_globals) {
+            context->VSGetConstantBuffers(0, 1, &vertex_globals);
+            context->PSGetConstantBuffers(0, 1, &pixel_globals);
+        }
         context->RSGetViewports(&viewport_count, viewports);
         context->RSGetScissorRects(&scissor_count, scissors);
         g_submitting_draw = true;
     }
     ~DrawRasterScope()
     {
+        restore_camera_constants(context);
+        if (restore_globals) {
+            context->VSSetConstantBuffers(0, 1, &vertex_globals);
+            context->PSSetConstantBuffers(0, 1, &pixel_globals);
+            if (vertex_globals) vertex_globals->Release();
+            if (pixel_globals) pixel_globals->Release();
+        }
         if (restore_scene_input)
         {
             g_internal_srv_bind = true;
@@ -981,10 +1047,84 @@ bool on_draw_indexed(reshade::api::command_list *cmd, std::uint32_t indices,
     return true;
 }
 
+bool on_dispatch(reshade::api::command_list *cmd, std::uint32_t,
+                 std::uint32_t, std::uint32_t)
+{
+    static thread_local bool submitting = false;
+    if (g_internal_render || submitting || cmd == nullptr || g_bound_compute_shader != 0xB821CC2B8D8E719Dull)
+        return false;
+    auto *state = g_mapping.get();
+    if (state == nullptr || state->quality_mode <= static_cast<LONG>(dos2dlss::QualityMode::dlaa) ||
+        state->render_width <= 0 || state->render_height <= 0)
+        return false;
+    auto *context = reinterpret_cast<ID3D11DeviceContext *>(cmd->get_native());
+    ID3D11UnorderedAccessView *view = nullptr;
+    context->CSGetUnorderedAccessViews(0, 1, &view);
+    if (view == nullptr) return false;
+    ID3D11Resource *resource = nullptr;
+    view->GetResource(&resource);
+    view->Release();
+    ID3D11Texture2D *texture = nullptr;
+    resource->QueryInterface(IID_PPV_ARGS(&texture));
+    bool native_ui = false;
+    AcquireSRWLockShared(&g_pipeline_lock);
+    const auto key = reinterpret_cast<std::uint64_t>(resource);
+    const auto origin = g_resource_callsites.find(key);
+    native_ui = g_native_ui_resources.contains(key) || (origin != g_resource_callsites.end() &&
+        std::find(origin->second.begin(), origin->second.end(), kNativeUiAllocationSite) != origin->second.end());
+    ReleaseSRWLockShared(&g_pipeline_lock);
+    resource->Release();
+    if (texture == nullptr) return false;
+    D3D11_TEXTURE2D_DESC desc = {};
+    texture->GetDesc(&desc);
+    texture->Release();
+    const int level = screen_level(desc.Width, desc.Height, state->backbuffer_width, state->backbuffer_height);
+    if (native_ui || level < 0) return false;
+    ID3D11Buffer *original = nullptr;
+    context->CSGetConstantBuffers(0, 1, &original);
+    if (original == nullptr) return false;
+    BufferSnapshot snapshot = {};
+    AcquireSRWLockShared(&g_pipeline_lock);
+    const auto found = g_buffer_snapshots.find(reinterpret_cast<std::uint64_t>(original));
+    if (found != g_buffer_snapshots.end()) snapshot = found->second;
+    ReleaseSRWLockShared(&g_pipeline_lock);
+    if (snapshot.size < 32) { original->Release(); return false; }
+    auto *rect = reinterpret_cast<std::uint32_t *>(snapshot.bytes.data() + 16);
+    if (rect[0] == 0 || rect[1] == 0 || rect[2] >= desc.Width || rect[3] >= desc.Height ||
+        rect[0] > desc.Width - rect[2] || rect[1] > desc.Height - rect[3]) {
+        original->Release(); return false;
+    }
+    const double sx = static_cast<double>((std::max)(1L, state->render_width >> level)) / desc.Width;
+    const double sy = static_cast<double>((std::max)(1L, state->render_height >> level)) / desc.Height;
+    const auto x = static_cast<std::uint32_t>(std::floor(rect[2] * sx));
+    const auto y = static_cast<std::uint32_t>(std::floor(rect[3] * sy));
+    rect[0] = static_cast<std::uint32_t>(std::ceil((static_cast<double>(rect[2]) + rect[0]) * sx)) - x;
+    rect[1] = static_cast<std::uint32_t>(std::ceil((static_cast<double>(rect[3]) + rect[1]) * sy)) - y;
+    rect[2] = x; rect[3] = y;
+    if (g_scaled_clear_constants == nullptr) {
+        ID3D11Device *device = nullptr;
+        context->GetDevice(&device);
+        D3D11_BUFFER_DESC buffer = {};
+        buffer.ByteWidth = 32; buffer.Usage = D3D11_USAGE_DEFAULT;
+        buffer.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        const auto result = device->CreateBuffer(&buffer, nullptr, &g_scaled_clear_constants);
+        device->Release();
+        if (FAILED(result)) { original->Release(); return false; }
+    }
+    submitting = true;
+    context->UpdateSubresource(g_scaled_clear_constants, 0, nullptr, snapshot.bytes.data(), 0, 0);
+    context->CSSetConstantBuffers(0, 1, &g_scaled_clear_constants);
+    context->Dispatch((rect[0] + 31) / 32, (rect[1] + 31) / 32, 1);
+    context->CSSetConstantBuffers(0, 1, &original);
+    original->Release();
+    submitting = false;
+    return true;
+}
+
 void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
                      const reshade::api::resource_view *rtvs, reshade::api::resource_view dsv)
 {
-    if (cmd == nullptr)
+    if (g_internal_render || cmd == nullptr)
         return;
     g_current_screen_level = -1;
     g_current_native_ui_target = false;
@@ -1148,14 +1288,17 @@ void on_init_pipeline(reshade::api::device *, reshade::api::pipeline_layout,
         if (object.data == nullptr || object.count == 0)
             continue;
         if (object.type != reshade::api::pipeline_subobject_type::vertex_shader &&
-            object.type != reshade::api::pipeline_subobject_type::pixel_shader)
+            object.type != reshade::api::pipeline_subobject_type::pixel_shader &&
+            object.type != reshade::api::pipeline_subobject_type::compute_shader)
             continue;
         const auto *descs = static_cast<const reshade::api::shader_desc *>(object.data);
         if (descs[0].code == nullptr || descs[0].code_size == 0)
             continue;
         const auto hash = hash_shader(descs[0].code, descs[0].code_size);
         const bool is_pixel = object.type == reshade::api::pipeline_subobject_type::pixel_shader;
-        if (!is_pixel)
+        if (object.type == reshade::api::pipeline_subobject_type::compute_shader)
+            shaders.compute = hash;
+        else if (!is_pixel)
             shaders.vertex = hash;
         else
             shaders.pixel = hash;
@@ -1170,7 +1313,7 @@ void on_init_pipeline(reshade::api::device *, reshade::api::pipeline_layout,
         }
         ReleaseSRWLockExclusive(&g_pipeline_lock);
     }
-    if (shaders.vertex == 0 && shaders.pixel == 0)
+    if (shaders.vertex == 0 && shaders.pixel == 0 && shaders.compute == 0)
         return;
     AcquireSRWLockExclusive(&g_pipeline_lock);
     g_pipeline_shaders[pipeline.handle] = shaders;
@@ -1187,6 +1330,7 @@ void on_destroy_pipeline(reshade::api::device *, reshade::api::pipeline pipeline
 void on_bind_pipeline(reshade::api::command_list *, reshade::api::pipeline_stage stages,
                       reshade::api::pipeline pipeline)
 {
+    if (g_internal_render) return;
     PipelineShaders shaders = {};
     AcquireSRWLockShared(&g_pipeline_lock);
     const auto entry = g_pipeline_shaders.find(pipeline.handle);
@@ -1199,12 +1343,15 @@ void on_bind_pipeline(reshade::api::command_list *, reshade::api::pipeline_stage
         g_bound_vertex_shader = shaders.vertex;
     if ((stage_bits & static_cast<std::uint32_t>(reshade::api::pipeline_stage::pixel_shader)) != 0)
         g_bound_pixel_shader = shaders.pixel;
+    if ((stage_bits & static_cast<std::uint32_t>(reshade::api::pipeline_stage::compute_shader)) != 0)
+        g_bound_compute_shader = shaders.compute;
 }
 
 void on_push_descriptors(reshade::api::command_list *, reshade::api::shader_stage stages,
                          reshade::api::pipeline_layout, std::uint32_t,
                          const reshade::api::descriptor_table_update &update)
 {
+    if (g_internal_render) return;
     const auto stage_bits = static_cast<std::uint32_t>(stages);
     const bool vertex = (stage_bits & static_cast<std::uint32_t>(
         reshade::api::shader_stage::vertex)) != 0;
@@ -1231,6 +1378,8 @@ void on_push_descriptors(reshade::api::command_list *, reshade::api::shader_stag
             // ReShade events. Do not mistake our temporary override for the
             // constant buffer the game intends to bind on later draws.
             const bool internal_buffer =
+                (g_scaled_pixel_viewport_constants != nullptr &&
+                 buffers[i].buffer.handle == reinterpret_cast<std::uint64_t>(g_scaled_pixel_viewport_constants)) ||
                 (g_scaled_viewport_constants != nullptr &&
                  buffers[i].buffer.handle == reinterpret_cast<std::uint64_t>(
                     g_scaled_viewport_constants)) ||
@@ -1418,10 +1567,11 @@ void on_present(reshade::api::command_queue *queue, reshade::api::swapchain *,
             InterlockedExchange(&state->camera_motion_ready, 0);
             InterlockedExchange(&state->camera_jitter_ready, 0);
         }
-        g_ngx.sync_feature(context, mode,
-                           static_cast<std::uint32_t>(state->backbuffer_width),
-                           static_cast<std::uint32_t>(state->backbuffer_height),
-                           state, &log_message);
+        InternalRenderScope internal;
+        PrivateContextState::Scope pipeline(g_private_context);
+        if (pipeline.active()) g_ngx.sync_feature(context, mode,
+            static_cast<std::uint32_t>(state->backbuffer_width),
+            static_cast<std::uint32_t>(state->backbuffer_height), state, &log_message);
     }
     InterlockedIncrement64(&state->frame_number);
     InterlockedExchange64(&state->draw_calls, InterlockedExchange64(&g_frame_draws, 0));
@@ -1623,6 +1773,7 @@ bool register_callbacks()
     reg(reshade::addon_event::push_descriptors, reinterpret_cast<void *>(&on_push_descriptors));
     reg(reshade::addon_event::draw, reinterpret_cast<void *>(&on_draw));
     reg(reshade::addon_event::draw_indexed, reinterpret_cast<void *>(&on_draw_indexed));
+    reg(reshade::addon_event::dispatch, reinterpret_cast<void *>(&on_dispatch));
     reg(reshade::addon_event::bind_render_targets_and_depth_stencil, reinterpret_cast<void *>(&on_bind_targets));
     reg(reshade::addon_event::present, reinterpret_cast<void *>(&on_present));
     reg(reshade::addon_event::reshade_present, reinterpret_cast<void *>(&on_reshade_present));
