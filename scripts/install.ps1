@@ -54,7 +54,7 @@ if ((Get-FileHash -LiteralPath $binkOriginal -Algorithm SHA256).Hash -ne $expect
 Copy-Item -LiteralPath $loaderSource -Destination $bink -Force
 
 Copy-Item -LiteralPath $nativeSource -Destination (Join-Path $nativeMods 'DOS2DLSSNative.dll') -Force
-Copy-Item -LiteralPath $addonSource -Destination (Join-Path $bin 'dos2-dlss.addon64') -Force
+Install-ModFile $addonSource (Join-Path $bin 'dos2-dlss.addon64') $backup
 $dlssRuntime = Join-Path $BuildDirectory 'nvngx_dlss.dll'
 if ((Test-Path -LiteralPath $dlssRuntime) -and
     -not (Test-Path -LiteralPath (Join-Path $bin 'nvngx_dlss.dll'))) {
@@ -94,7 +94,7 @@ foreach ($leaf in @('DLSS5 DX11 Bridge.addon64', 'renodx-dlss5.addon64')) {
 }
 $nrBridge = Join-Path $BuildDirectory 'dos2-nr-bridge.addon64'
 if (-not $PauseNeuralRendering -and (Test-Path -LiteralPath $nrBridge)) {
-    Copy-Item -LiteralPath $nrBridge -Destination (Join-Path $bin 'DLSS5 DX11 Bridge.addon64') -Force
+    Install-ModFile $nrBridge (Join-Path $bin 'DLSS5 DX11 Bridge.addon64') $backup
 }
 
 # DOS2 ships the Windows 8.1 SDK build of D3DCompiler. RenoDX's DLSS5 proxy

@@ -26,3 +26,24 @@ function ConvertFrom-JsonMap {
         return $result
     }
 }
+
+function Install-ModFile {
+    param([string]$Source, [string]$Destination, [string]$BackupDirectory)
+    try { Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop }
+    catch {
+        if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) { throw }
+        # A debugger/scanner can retain a read handle after the game exits.
+        # Rename preserves that file and its handle while allowing an update.
+        $saved = Join-Path $BackupDirectory ((Split-Path $Destination -Leaf) + '.' + [DateTime]::UtcNow.Ticks + '.previous')
+        Move-Item -LiteralPath $Destination -Destination $saved -ErrorAction Stop
+        try { Copy-Item -LiteralPath $Source -Destination $Destination -ErrorAction Stop }
+        catch {
+            # Copy can fail after creating a partial replacement.
+            if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+                Remove-Item -LiteralPath $Destination -Force -ErrorAction Stop
+            }
+            Move-Item -LiteralPath $saved -Destination $Destination -ErrorAction Stop
+            throw
+        }
+    }
+}
