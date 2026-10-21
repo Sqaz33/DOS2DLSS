@@ -107,9 +107,14 @@ if (Test-Path -LiteralPath $compiler) {
     $compilerVersion = (Get-Item -LiteralPath $compiler).VersionInfo.FileVersion
     if ($compilerVersion -like '6.3.9600.*') {
         if (Test-Path -LiteralPath $compilerDisabled) {
-            throw 'Both active and DOS2DLSS-disabled copies of d3dcompiler_47.dll exist.'
+            # Steam may restore this DLL while the previous mod backup remains.
+            # Preserve that backup and move the restored file out of the loader path.
+            $restoredHash = (Get-FileHash -LiteralPath $compiler -Algorithm SHA256).Hash
+            $restoredBackup = Join-Path $backup ('d3dcompiler_47.reinstalled.' + $restoredHash + '.dll')
+            Move-Item -LiteralPath $compiler -Destination $restoredBackup -Force
+        } else {
+            Move-Item -LiteralPath $compiler -Destination $compilerDisabled
         }
-        Move-Item -LiteralPath $compiler -Destination $compilerDisabled
     }
 }
 if (Test-Path -LiteralPath $compilerDisabled) {
