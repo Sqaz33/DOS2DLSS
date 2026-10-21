@@ -15,3 +15,19 @@ Progress:
 - Updated SR transforms to preserve viewport/scissor origins; added missing outline blur VS hashes and PS clamp correction; scaled ClearRT partial clears consistently. User confirmed silhouettes now align with objects.
 - Scoped per-draw VS/PS globals and camera overrides; isolated NGX feature creation/evaluation with D3D11.1 context-state swapping and ignored addon-internal binding events.
 - Text is still absent in some Scaleform windows/HP labels. Do not mark fixed. RenderDoc capture in progress to locate the actual text draw.
+
+Font investigation:
+- RenderDoc under NGX returns 0xBAD00002, so its unscaled captures are controls, not proof of native DLSS correctness.
+- Added status --probe-scale W H (only allowed when NGX is unavailable) to reproduce the scale transform separately. Capture scaled-ui_frame5169.rdc; high-severity validation messages absent in the control capture. Large captures stay ignored.
+- No broad shader-name search yielded a font symbol. Narrowed by startup A/B: starting in DLAA creates readable modal text; switching to Quality preserves it. Starting immediately in Quality corrupts initial text-cache production.
+- Early UI allocation paths and 2D matrix/shader classification alone did not fix first-Quality startup. Kept explicit UI passthrough and limited UV changes to scene-sized inputs.
+- New scene phase starts at scene depth prepass/MRT G-buffer and ends at CombineUI/present. Excludes pre-scene UI/cache work. Initial MRT-only boundary made text readable but missed depth prepass, so expanded to 3D full-size depth draws. Verification in progress.
+- Game emits a pre-existing story/addon-settings warning after reinstall; it became readable in DLAA. Do not modify story mods or saves as part of a rendering fix.
+
+Verified on 2026-10-22:
+- Actual scene depth prepass is depth-only (capture pass 111); G-buffer follows at pass 112. Broad full-size DSV detection accidentally reopened scaling inside Scaleform, corrupting initial text. Restricted phase opening to depth-only geometry, preserving matching jitter/rectangle for depth and G-buffer.
+- Font/filter producer BB1B5991680FE117 writes full-size temporary targets (allocation 1EF2087); included alongside the two existing Scaleform shaders and learned its targets before skipping UI draws.
+- Fresh-process Quality -> existing sdf/Reaper's Coast save: warning and Accept caption readable, world geometry restored. Hover farmer: name, 0/1182, level14 and status text visible; correct outline. Mode switches Balanced/Performance/DLAA/Off/Quality preserved text/minimap, NGX success. Newly opened inventory text and item counts readable. Evidence listed in docs/text-and-outline-fix.md.
+- Profile Debug_Client_Profile_1 displayed stale menu labels after switching; restarting from game working directory restored sdf and enabled Continue. No profile binary edits were needed.
+- Installer read-handle replacement test passed with original backup intact. Diagnostic probe-scale is forbidden when NGX is initialized.
+- Test PID 29500 closed. Native UI baseline was tested with NR paused; final installation restores the previous NR addon files. No FPS or NR improvement is claimed.

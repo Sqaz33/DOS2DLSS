@@ -21,7 +21,7 @@
 #include "reshade_api.hpp"
 #include "reshade_events.hpp"
 
-extern "C" __declspec(dllexport) const char *NAME = "DOS2 DLSS 0.6.1";
+extern "C" __declspec(dllexport) const char *NAME = "DOS2 DLSS 0.6.2-dev";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Controls and diagnostics for the native Divinity: Original Sin 2 DLSS integration.";
 
@@ -74,10 +74,24 @@ constexpr std::uint64_t kCombineUiPixelShader = 0x7D52DF001176EB8Dull;
 // on the supported executable. It is available before the first UI draw, while
 // learning the texture from the final CombineUI pass is one frame too late.
 constexpr std::uint64_t kNativeUiAllocationSite = 0x1DC57A3ull;
+constexpr std::uint64_t kScaleformAllocationSite = 0x1EE8A2Eull;
+bool is_ui_allocation(const std::array<std::uint64_t, 4> &sites)
+{
+    return std::find(sites.begin(), sites.end(), kNativeUiAllocationSite) != sites.end() ||
+           std::find(sites.begin(), sites.end(), kScaleformAllocationSite) != sites.end();
+}
+bool is_scaleform_vertex_shader(std::uint64_t shader)
+{
+    return shader == 0xBD26BCCCC2592798ull || shader == 0x29309D28C1B99C79ull ||
+           shader == 0xBB1B5991680FE117ull;
+}
+thread_local std::uint64_t g_current_color_target = 0;
 thread_local int g_current_screen_level = -1;
 thread_local bool g_current_native_ui_target = false;
 thread_local bool g_current_gbuffer_target = false;
 thread_local bool g_current_scene_depth_target = false;
+thread_local bool g_current_full_scene_depth_target = false;
+thread_local bool g_scene_render_phase = false;
 thread_local bool g_camera_override_bound = false;
 volatile LONG64 g_scene_depth_resource = 0;
 std::uintptr_t g_exe_base = 0;
@@ -141,6 +155,7 @@ struct BufferSnapshot
 {
     std::array<std::uint8_t, 512> bytes = {};
     std::size_t size = 0;
+    bool ui_view = false;
 };
 
 struct MappedBuffer
@@ -266,6 +281,7 @@ void on_destroy_resource(reshade::api::device *, reshade::api::resource resource
     AcquireSRWLockExclusive(&g_pipeline_lock);
     g_native_ui_resources.erase(resource.handle);
     g_resource_callsites.erase(resource.handle);
+    g_buffer_snapshots.erase(resource.handle);
     ReleaseSRWLockExclusive(&g_pipeline_lock);
 }
 
@@ -327,6 +343,15 @@ void save_buffer_snapshot(std::uint64_t resource, const void *data,
     snapshot.size = static_cast<std::size_t>((std::min)(size,
         static_cast<std::uint64_t>(snapshot.bytes.size())));
     std::memcpy(snapshot.bytes.data(), data, snapshot.size);
+    // Native font/layout passes use an identity View and zero near/far planes.
+    // They can target pooled textures allocated by the ordinary scene allocator.
+    if (snapshot.size >= 224) {
+        float view[56] = {};
+        std::memcpy(view, snapshot.bytes.data(), sizeof(view));
+        snapshot.ui_view = view[52] == 0.0f && view[53] == 0.0f;
+        for (int i = 0; i < 16 && snapshot.ui_view; ++i)
+            snapshot.ui_view = view[i] == ((i % 5 == 0) ? 1.0f : 0.0f);
+    }
     AcquireSRWLockExclusive(&g_pipeline_lock);
     g_buffer_snapshots[resource] = snapshot;
     ReleaseSRWLockExclusive(&g_pipeline_lock);
@@ -753,8 +778,35 @@ bool bind_jittered_camera_constants(ID3D11DeviceContext *context,
     return true;
 }
 
+bool has_scaled_scene_input(ID3D11DeviceContext *context, dos2dlss::SharedState *state)
+{
+    ID3D11ShaderResourceView *view = nullptr;
+    context->PSGetShaderResources(0, 1, &view);
+    if (view == nullptr) return false;
+    ID3D11Resource *resource = nullptr;
+    view->GetResource(&resource);
+    view->Release();
+    ID3D11Texture2D *texture = nullptr;
+    resource->QueryInterface(IID_PPV_ARGS(&texture));
+    bool ui = false;
+    AcquireSRWLockShared(&g_pipeline_lock);
+    const auto key = reinterpret_cast<std::uint64_t>(resource);
+    const auto origin = g_resource_callsites.find(key);
+    ui = g_native_ui_resources.contains(key) ||
+        (origin != g_resource_callsites.end() && is_ui_allocation(origin->second));
+    ReleaseSRWLockShared(&g_pipeline_lock);
+    resource->Release();
+    if (texture == nullptr) return false;
+    D3D11_TEXTURE2D_DESC desc = {};
+    texture->GetDesc(&desc);
+    texture->Release();
+    return !ui && screen_level(desc.Width, desc.Height,
+        state->backbuffer_width, state->backbuffer_height) >= 0;
+}
+
 void prepare_draw_resolution(reshade::api::command_list *cmd)
 {
+    if (!g_scene_render_phase) return;
     auto *state = g_mapping.get();
     if (cmd == nullptr || state == nullptr)
         return;
@@ -812,7 +864,8 @@ void prepare_draw_resolution(reshade::api::command_list *cmd)
     // The final combine samples our already full-resolution DLSS output and
     // the native UI. Scaling its shared interpolator would zoom both inputs.
     const bool scale_uv = fullscreen && !g_current_native_ui_target &&
-                          g_bound_pixel_shader != kCombineUiPixelShader;
+                          g_bound_pixel_shader != kCombineUiPixelShader &&
+                          (g_current_screen_level >= 0 || has_scaled_scene_input(context, state));
     bind_viewport_uv_constants(context, scale_uv,
         static_cast<float>(render_width) / static_cast<float>(output_width),
         static_cast<float>(render_height) / static_cast<float>(output_height));
@@ -959,6 +1012,41 @@ void evaluate_native_dlss(reshade::api::command_list *cmd)
 // All viewport overrides are local to one draw. DOS2 caches raster state;
 // leaving an override bound stretches later UI even if its target is known.
 thread_local bool g_submitting_draw = false;
+bool is_ui_draw()
+{
+    if (g_current_native_ui_target) return true;
+    // Learn both the main UI surface and its pooled glyph/filter intermediates
+    // from their producer, before any scene-sized viewport heuristic runs.
+    if (is_scaleform_vertex_shader(g_bound_vertex_shader)) {
+        g_current_native_ui_target = true;
+        if (g_current_color_target != 0) {
+            AcquireSRWLockExclusive(&g_pipeline_lock);
+            g_native_ui_resources.insert(g_current_color_target);
+            ReleaseSRWLockExclusive(&g_pipeline_lock);
+        }
+    }
+    if (g_current_native_ui_target) return true;
+    const auto &range = g_bound_vertex_constant_buffers[12];
+    bool result = false;
+    if (range.buffer.handle != 0 && range.offset == 0) {
+        AcquireSRWLockShared(&g_pipeline_lock);
+        const auto found = g_buffer_snapshots.find(range.buffer.handle);
+        result = found != g_buffer_snapshots.end() && found->second.ui_view;
+        ReleaseSRWLockShared(&g_pipeline_lock);
+    }
+    return result && g_bound_pixel_shader != kCombineUiPixelShader;
+}
+void begin_scene_draw_phase()
+{
+    // The depth prepass precedes MRT G-buffer binding. It must use the same
+    // rectangle, but UI/stencil geometry sharing this depth surface must not.
+    if (!g_scene_render_phase && g_current_full_scene_depth_target &&
+        g_bound_vertex_shader != 0 && !is_fullscreen_vertex_shader(g_bound_vertex_shader) &&
+        !is_ui_draw()) {
+        g_scene_render_phase = true;
+        g_current_scene_depth_target = true;
+    }
+}
 struct DrawRasterScope
 {
     ID3D11DeviceContext *context;
@@ -1013,6 +1101,16 @@ bool on_draw(reshade::api::command_list *cmd, std::uint32_t vertices,
 {
     if (g_submitting_draw)
         return false;
+    begin_scene_draw_phase();
+    const auto *state = g_mapping.get();
+    if (!g_scene_render_phase || is_ui_draw() || state == nullptr || state->quality_mode <= 0) {
+        if (g_diagnostics) InterlockedIncrement64(&g_frame_draws);
+        if (g_capture_active && g_current_captured_pass >= 0) {
+            ++g_captured_passes[g_current_captured_pass].draws;
+            record_bound_state(cmd);
+        }
+        return false;
+    }
     DrawRasterScope raster(cmd);
     prepare_draw_resolution(cmd);
     evaluate_native_dlss(cmd);
@@ -1024,6 +1122,7 @@ bool on_draw(reshade::api::command_list *cmd, std::uint32_t vertices,
         record_bound_state(cmd);
     }
     raster.context->DrawInstanced(vertices, instances, first_vertex, first_instance);
+    if (g_bound_pixel_shader == kCombineUiPixelShader) g_scene_render_phase = false;
     return true;
 }
 
@@ -1033,6 +1132,16 @@ bool on_draw_indexed(reshade::api::command_list *cmd, std::uint32_t indices,
 {
     if (g_submitting_draw)
         return false;
+    begin_scene_draw_phase();
+    const auto *state = g_mapping.get();
+    if (!g_scene_render_phase || is_ui_draw() || state == nullptr || state->quality_mode <= 0) {
+        if (g_diagnostics) InterlockedIncrement64(&g_frame_indexed_draws);
+        if (g_capture_active && g_current_captured_pass >= 0) {
+            ++g_captured_passes[g_current_captured_pass].indexed_draws;
+            record_bound_state(cmd);
+        }
+        return false;
+    }
     DrawRasterScope raster(cmd);
     prepare_draw_resolution(cmd);
     evaluate_native_dlss(cmd);
@@ -1044,6 +1153,7 @@ bool on_draw_indexed(reshade::api::command_list *cmd, std::uint32_t indices,
         record_bound_state(cmd);
     }
     raster.context->DrawIndexedInstanced(indices, instances, first_index, vertex_offset, first_instance);
+    if (g_bound_pixel_shader == kCombineUiPixelShader) g_scene_render_phase = false;
     return true;
 }
 
@@ -1051,7 +1161,7 @@ bool on_dispatch(reshade::api::command_list *cmd, std::uint32_t,
                  std::uint32_t, std::uint32_t)
 {
     static thread_local bool submitting = false;
-    if (g_internal_render || submitting || cmd == nullptr || g_bound_compute_shader != 0xB821CC2B8D8E719Dull)
+    if (g_internal_render || !g_scene_render_phase || submitting || cmd == nullptr || g_bound_compute_shader != 0xB821CC2B8D8E719Dull)
         return false;
     auto *state = g_mapping.get();
     if (state == nullptr || state->quality_mode <= static_cast<LONG>(dos2dlss::QualityMode::dlaa) ||
@@ -1070,8 +1180,8 @@ bool on_dispatch(reshade::api::command_list *cmd, std::uint32_t,
     AcquireSRWLockShared(&g_pipeline_lock);
     const auto key = reinterpret_cast<std::uint64_t>(resource);
     const auto origin = g_resource_callsites.find(key);
-    native_ui = g_native_ui_resources.contains(key) || (origin != g_resource_callsites.end() &&
-        std::find(origin->second.begin(), origin->second.end(), kNativeUiAllocationSite) != origin->second.end());
+    native_ui = g_native_ui_resources.contains(key) ||
+        (origin != g_resource_callsites.end() && is_ui_allocation(origin->second));
     ReleaseSRWLockShared(&g_pipeline_lock);
     resource->Release();
     if (texture == nullptr) return false;
@@ -1127,9 +1237,11 @@ void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
     if (g_internal_render || cmd == nullptr)
         return;
     g_current_screen_level = -1;
+    g_current_color_target = 0;
     g_current_native_ui_target = false;
     g_current_gbuffer_target = false;
     g_current_scene_depth_target = false;
+    g_current_full_scene_depth_target = false;
     auto *bound_device = cmd->get_device();
     const auto *state = g_mapping.get();
     const auto output_width = state != nullptr ? static_cast<std::uint32_t>(
@@ -1143,15 +1255,14 @@ void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
             first_resource = bound_device->get_resource_from_view(rtvs[0]);
         if (first_resource.handle != 0)
         {
+            g_current_color_target = first_resource.handle;
             const auto desc = bound_device->get_resource_desc(first_resource);
             g_current_screen_level = screen_level(desc.texture.width, desc.texture.height,
                                                   output_width, output_height);
             AcquireSRWLockShared(&g_pipeline_lock);
             const auto origin = g_resource_callsites.find(first_resource.handle);
             if (origin != g_resource_callsites.end())
-                g_current_native_ui_target = std::find(
-                    origin->second.begin(), origin->second.end(),
-                    kNativeUiAllocationSite) != origin->second.end();
+                g_current_native_ui_target = is_ui_allocation(origin->second);
             if (!g_current_native_ui_target)
                 g_current_native_ui_target =
                     g_native_ui_resources.contains(first_resource.handle);
@@ -1171,6 +1282,13 @@ void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
     if (bound_device != nullptr && dsv.handle != 0)
     {
         const auto depth_resource = bound_device->get_resource_from_view(dsv);
+        if (depth_resource.handle != 0) {
+            const auto depth = bound_device->get_resource_desc(depth_resource);
+            // Scaleform shares the screen-sized scene DSV while writing its
+            // glyph caches. Only depth-only geometry can open the 3D phase.
+            g_current_full_scene_depth_target = count == 0 && depth.texture.width == output_width &&
+                depth.texture.height == output_height;
+        }
         const auto known_depth = static_cast<std::uint64_t>(
             InterlockedCompareExchange64(&g_scene_depth_resource, 0, 0));
         g_current_scene_depth_target = depth_resource.handle != 0 &&
@@ -1200,6 +1318,7 @@ void on_bind_targets(reshade::api::command_list *cmd, std::uint32_t count,
                 fourth.texture.format == reshade::api::format::r8g8b8a8_unorm;
             if (g_current_gbuffer_target)
             {
+                g_scene_render_phase = true;
                 InterlockedExchange64(&g_scene_depth_resource,
                                       static_cast<LONG64>(depth_resource.handle));
                 g_current_scene_depth_target = true;
@@ -1534,6 +1653,7 @@ void on_present(reshade::api::command_queue *queue, reshade::api::swapchain *,
                 const reshade::api::rect *, const reshade::api::rect *,
                 std::uint32_t, const reshade::api::rect *)
 {
+    g_scene_render_phase = false;
     auto *state = g_mapping.get();
     if (state == nullptr)
         return;
@@ -1819,7 +1939,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
             return FALSE;
         auto *state = g_mapping.get();
         InterlockedExchange(&state->quality_mode, load_mode());
-        g_diagnostics = GetPrivateProfileIntW(L"DOS2DLSS", L"Diagnostics", 1, g_config_path) != 0;
+        g_diagnostics = GetPrivateProfileIntW(L"DOS2DLSS", L"Diagnostics", 0, g_config_path) != 0;
 
         if (!register_with_reshade() || !register_callbacks())
         {
@@ -1828,7 +1948,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         }
         InterlockedExchange(&state->addon_ready, 1);
         update_status(L"ReShade probe panel registered.");
-        log_line("DOS2 DLSS 0.6.1 registered with ReShade.");
+        log_line("DOS2 DLSS 0.6.2-dev registered with ReShade.");
     }
     else if (reason == DLL_PROCESS_DETACH && reserved == nullptr)
     {

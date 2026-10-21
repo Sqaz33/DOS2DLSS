@@ -9,7 +9,8 @@ int wmain(int argc, wchar_t **argv)
     const bool request_capture = argc == 2 && _wcsicmp(argv[1], L"--capture") == 0;
     const bool request_screenshot = argc == 2 && _wcsicmp(argv[1], L"--screenshot") == 0;
     const bool set_mode = argc == 3 && _wcsicmp(argv[1], L"--mode") == 0;
-    const DWORD access = (request_capture || request_screenshot || set_mode)
+    const bool probe_scale = argc == 4 && _wcsicmp(argv[1], L"--probe-scale") == 0;
+    const DWORD access = (request_capture || request_screenshot || set_mode || probe_scale)
         ? FILE_MAP_ALL_ACCESS : FILE_MAP_READ;
     HANDLE mapping = OpenFileMappingW(access, FALSE, dos2dlss::kSharedMappingName);
     if (mapping == nullptr)
@@ -31,6 +32,19 @@ int wmain(int argc, wchar_t **argv)
         InterlockedExchange(&state->capture_complete, 0);
         InterlockedExchange(&state->capture_requested, 1);
         wprintf(L"Render-pass capture requested.\n");
+    }
+    if (probe_scale)
+    {
+        const long width = wcstol(argv[2], nullptr, 10), height = wcstol(argv[3], nullptr, 10);
+        if (state->ngx_initialized || width <= 0 || height <= 0 ||
+            width > state->backbuffer_width || height > state->backbuffer_height) {
+            fwprintf(stderr, L"Scale probe requires unavailable NGX and dimensions within the output.\n");
+            UnmapViewOfFile(state); CloseHandle(mapping); return 4;
+        }
+        InterlockedExchange(&state->quality_mode, 2);
+        InterlockedExchange(&state->render_width, width);
+        InterlockedExchange(&state->render_height, height);
+        wprintf(L"Diagnostic scale only (no DLSS): %ldx%ld.\n", width, height);
     }
     if (request_screenshot)
     {
